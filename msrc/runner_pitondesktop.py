@@ -1,0 +1,1785 @@
+
+import json, os, sys, threading, subprocess, shlex, time, signal, html
+from dataclasses    import dataclass, field
+from typing         import Any, Dict, List, Optional
+from PySide6        import QtCore, QtGui, QtWidgets
+from PySide6.QtCore import Qt
+from pathlib        import Path
+os.environ["QT_LOGGING_RULES"] = "qt.qpa.window=false"
+from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel, QTextEdit
+
+# ======== class QProcRunner ==============================================================
+# =========================================================================================
+class QProcRunner(QtCore.QObject):
+    lineReady = QtCore.Signal(str)   # stdout/stderr lines
+    finished  = QtCore.Signal(int)   # exit code
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.p = QtCore.QProcess(self)
+        self.p.setProcessChannelMode(QtCore.QProcess.MergedChannels)
+        self.p.readyReadStandardOutput.connect(self._on_ready)
+        self.p.finished.connect(self._on_finished)
+
+    def start(self, cmd_list, cwd=None, env: dict | None = None):
+        program, args = cmd_list[0], cmd_list[1:]
+        if cwd:
+            self.p.setWorkingDirectory(str(cwd))
+        if env:
+            qenv = QtCore.QProcessEnvironment.systemEnvironment()
+            for k, v in env.items():
+                qenv.insert(str(k), str(v))
+            self.p.setProcessEnvironment(qenv)
+        self.p.start(program, args)
+
+    def kill(self):
+        if self.p.state() != QtCore.QProcess.NotRunning:
+            self.p.kill()
+
+    def _on_ready(self):
+        data = bytes(self.p.readAllStandardOutput())
+        text = data.decode(errors="replace")
+        for line in text.splitlines():
+            self.lineReady.emit(line)
+
+    def _on_finished(self, code, _status):
+        self.finished.emit(int(code))
+
+
+# ---------- Data Models ----------
+# ======== class InputSpec ================================================================
+# =========================================================================================
+@dataclass
+class InputSpec:
+    name: str
+    type: str = "string"  # string | int | float | file | folder | enum
+    label: Optional[str] = None
+    default: Optional[Any] = None
+    choices: Optional[List[str]] = None  # for enum
+    placeholder: Optional[str] = None
+    required: bool = False
+    readonly: bool = False
+
+
+# ======== class ToolSpec =================================================================
+# =========================================================================================
+@dataclass
+class ToolSpec:
+    name: str
+    runner_mode: str = "module"           # module | command
+    runner: str = ""                      # "pkg.mod:function" OR command template
+    script: Optional[str] = None          # optional helper for command template
+    output_dir_optional: bool = False
+    inputs: List[InputSpec] = field(default_factory=list)
+    notes: Optional[str] = None
+
+
+# ======== MAIN ===========================================================================
+# =========================================================================================
+# ---------- Utilities ----------
+def load_config(path: str) -> List[ToolSpec]:
+    """Load the tools config file. 
+    If missing, create a simple default config with one fake tool."""
+    if not os.path.exists(path):
+        # --- create starter config ---
+        default_config = [
+            {
+                "name": "Sample Tool (Demo)",
+                "runner_mode": "command",
+                "runner": "{python} -c \"print('Hello from sample tool!')\"",
+                "script": None,
+                "output_dir_optional": False,
+                "inputs": [],
+                "notes": "This is a placeholder tool automatically created because config file was missing."
+            }
+        ]
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(default_config, f, indent=2, ensure_ascii=False)
+        print(f"[!] Config file not found. Created default at: {path}")
+
+    # --- load normally ---
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    tools: List[ToolSpec] = []
+    for t in raw:
+        tools.append(
+            ToolSpec(
+                name=t.get("name", "Untitled"),
+                runner_mode=t.get("runner_mode", "module"),
+                runner=t.get("runner", ""),
+                script=t.get("script"),
+                output_dir_optional=t.get("output_dir_optional", False),
+                inputs=[InputSpec(**i) for i in t.get("inputs", [])],
+                notes=t.get("notes")
+            )
+        )
+    return tools
+
+def save_config(path: str, tools: List[ToolSpec]):
+    data = []
+    for t in tools:
+        data.append({
+            "name": t.name,
+            "runner_mode": t.runner_mode,
+            "runner": t.runner,
+            "script": t.script,
+            "output_dir_optional": False,
+            "inputs": [i.__dict__ for i in t.inputs],
+            "notes": t.notes
+        })
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+def parse_module_runner(s: str):
+    # "pkg.mod:function" -> ("pkg.mod", "function")
+    if ":" not in s:
+        raise ValueError("Runner must be 'pkg.module:function'")
+    mod, func = s.split(":", 1)
+    return mod.strip(), func.strip()
+
+# ---------- Runner Thread ----------
+# ======== class ProcRunner ===============================================================
+# =========================================================================================
+class ProcRunner(QtCore.QObject):
+    lineReady   = QtCore.Signal(str)
+    finished    = QtCore.Signal(int)
+    started     = QtCore.Signal()
+    error       = QtCore.Signal(str)
+
+    def __init__(self, cmd: List[str], cwd: Optional[str] = None):
+        super().__init__()
+        self.cmd = cmd
+        self.cwd = cwd
+        self.proc: Optional[subprocess.Popen] = None
+        self._stop = False
+
+    @QtCore.Slot()
+    def run(self):
+        try:
+            self.started.emit()
+            self.proc = subprocess.Popen(
+                self.cmd,
+                cwd=self.cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1,
+                universal_newlines=True,
+                text=True,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+            )
+            for line in self.proc.stdout:
+                self.lineReady.emit(line.rstrip("\n"))
+                if self._stop:
+                    break
+            rc = self.proc.wait()
+            self.finished.emit(rc)
+        except Exception as e:
+            self.error.emit(str(e))
+            self.finished.emit(-1)
+
+    def stop(self):
+        self._stop = True
+        try:
+            if self.proc:
+                if os.name == "nt":
+                    # try soft break then kill
+                    self.proc.send_signal(signal.CTRL_BREAK_EVENT)
+                    time.sleep(0.4)
+                    self.proc.kill()
+                else:
+                    self.proc.terminate()
+                    time.sleep(0.5)
+                    if self.proc.poll() is None:
+                        self.proc.kill()
+        except Exception:
+            pass
+
+# ---------- Tool Editor Dialog ----------
+# ======== class ToolEditor ===============================================================
+# =========================================================================================
+class ToolEditor(QtWidgets.QDialog):
+    def __init__(self, parent=None, tool: Optional[ToolSpec]=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add / Edit Tool")
+        self.setMinimumWidth(750)
+        self.tool = tool or ToolSpec(name="New Tool")
+        self.inputs_table = QtWidgets.QTableWidget(0, 7)
+        self.inputs_table.setHorizontalHeaderLabels(["Name","Type","Label","Default","Choices","Required", "Read Only"])
+        # === Style the header ===
+        header = self.inputs_table.horizontalHeader()
+        header.setStyleSheet("""
+            QHeaderView::section {
+                background-color: #80ADE4F7 ;   /* #80ADE4F7 light blue highlight */
+                color: black;                /* text color */
+                font-weight: bold;
+                border: 1px solid #ccc;
+                padding: 6px;
+            }
+        """)
+        self.inputs_table.horizontalHeader().setStretchLastSection(True)
+        self.inputs_table.verticalHeader().setVisible(False)
+
+        # Top fields
+        self.name_edit = QtWidgets.QLineEdit(self.tool.name)
+        self.mode_cb   = QtWidgets.QComboBox(); self.mode_cb.addItems(["module","command"])
+        self.mode_cb.setCurrentText(self.tool.runner_mode)
+        self.runner_edit = QtWidgets.QLineEdit(self.tool.runner)
+        self.script_edit = QtWidgets.QLineEdit(self.tool.script or "")
+        self.script_btn  = QtWidgets.QPushButton("...")
+        self.script_btn.clicked.connect(self._pick_script)
+        # self.output_opt  = QtWidgets.QCheckBox("Output folder optional"); self.output_opt.setChecked(self.tool.output_dir_optional)
+        self.notes_edit  = QtWidgets.QPlainTextEdit(self.tool.notes or "")
+
+        # Layout
+        form = QtWidgets.QFormLayout()
+        form.addRow("Name:", self.name_edit)
+        
+        form.addRow("Runner mode:", self.mode_cb)
+        form.addRow("Runner:", self.runner_edit)
+        scr_row = QtWidgets.QHBoxLayout(); scr_row.addWidget(self.script_edit); scr_row.addWidget(self.script_btn)
+        form.addRow("Script:", scr_row)
+        # form.addRow(self.output_opt)
+        form.addRow("Notes:", self.notes_edit)
+
+        # Inputs section
+        input_bar = QtWidgets.QHBoxLayout()
+        add_btn = QtWidgets.QPushButton("Add Input")
+        remove_btn = QtWidgets.QPushButton("Remove Selected")
+        add_btn.clicked.connect(self._add_input_row)
+        remove_btn.clicked.connect(self._remove_selected_input_rows)
+        input_bar.addWidget(add_btn); input_bar.addWidget(remove_btn); input_bar.addStretch()
+
+        btn_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+
+        v = QtWidgets.QVBoxLayout(self)
+        v.addLayout(form)
+        v.addSpacing(10)
+        v.addLayout(input_bar)
+        v.addWidget(self.inputs_table)
+        v.addWidget(btn_box)
+
+        # load existing inputs
+        for i in self.tool.inputs:
+            self._add_input_row(i)
+
+    def _pick_python(self):
+        fn, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select python.exe", "", "Executables (*.exe);;All files (*.*)")
+        if fn:
+            self.py_edit.setText(fn)
+
+    def _pick_script(self):
+        fn, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select script", "", "Python (*.py);;All files (*.*)")
+        if fn:
+            self.script_edit.setText(fn)
+            
+            
+    def _add_input_row(self, spec: Optional[InputSpec] = None):
+        r = self.inputs_table.rowCount()
+        self.inputs_table.insertRow(r)
+
+		# Name
+        name = QtWidgets.QLineEdit(spec.name if spec else "")
+        self.inputs_table.setCellWidget(r, 0, name)
+
+		# Type
+        type_cb = QtWidgets.QComboBox()
+        type_cb.addItems(["string","int","float","file","folder","enum","multienum","toggle","date","list"])
+
+        type_cb.setCurrentText(spec.type if spec else "string")
+        self.inputs_table.setCellWidget(r, 1, type_cb)
+
+		# Label
+        label = QtWidgets.QLineEdit(spec.label if spec else "")
+        self.inputs_table.setCellWidget(r, 2, label)
+
+		# Default
+        default = QtWidgets.QLineEdit("" if not spec or spec.default is None else str(spec.default))
+        self.inputs_table.setCellWidget(r, 3, default)
+
+		# Choices
+        choices = QtWidgets.QLineEdit("" if not spec or not spec.choices else ",".join(spec.choices))
+        self.inputs_table.setCellWidget(r, 4, choices)
+
+		# Required (centered via layout)
+        # req = QtWidgets.QCheckBox()
+        # req.setChecked(spec.required if spec else False)
+        
+        
+        # Required (centered)
+        req = QtWidgets.QCheckBox()
+        req.setChecked(spec.required if spec else False)
+        cell_req = QtWidgets.QWidget()
+        lay_req = QtWidgets.QHBoxLayout(cell_req); lay_req.setContentsMargins(0,0,0,0)
+        lay_req.addStretch(1); lay_req.addWidget(req); lay_req.addStretch(1)
+        self.inputs_table.setCellWidget(r, 5, cell_req)
+
+        # Read-only (centered)
+        ro = QtWidgets.QCheckBox()
+        ro.setChecked(getattr(spec, "readonly", False) if spec else False)
+        cell_ro = QtWidgets.QWidget()
+        lay_ro = QtWidgets.QHBoxLayout(cell_ro); lay_ro.setContentsMargins(0,0,0,0)
+        lay_ro.addStretch(1); lay_ro.addWidget(ro); lay_ro.addStretch(1)
+        self.inputs_table.setCellWidget(r, 6, cell_ro)
+        
+    def _remove_selected_input_rows(self):
+        rows = sorted(set([i.row() for i in self.inputs_table.selectedIndexes()]), reverse=True)
+        for r in rows:
+            self.inputs_table.removeRow(r)
+
+    def _get_required_checked(self, row: int) -> bool:
+        cell = self.inputs_table.cellWidget(row, 5)
+        if cell is None:
+            return False
+        layout = cell.layout()
+        if layout is None:
+            return False
+        for i in range(layout.count()):
+            w = layout.itemAt(i).widget()
+            if isinstance(w, QtWidgets.QCheckBox):
+                return w.isChecked()
+        return False
+    
+    def _get_checkbox_checked(self, row: int, col: int) -> bool:
+        cell = self.inputs_table.cellWidget(row, col)
+        if not cell: return False
+        lay = cell.layout()
+        if not lay: return False
+        for i in range(lay.count()):
+            w = lay.itemAt(i).widget()
+            if isinstance(w, QtWidgets.QCheckBox):
+                return w.isChecked()
+        return False
+
+
+    def result_tool(self) -> ToolSpec:
+        # Build ToolSpec from UI
+        inputs: List[InputSpec] = []
+        
+        for r in range(self.inputs_table.rowCount()):
+            name = self.inputs_table.cellWidget(r, 0).text().strip()
+            if not name:
+                continue
+
+            type_cb: QtWidgets.QComboBox = self.inputs_table.cellWidget(r, 1)
+            itype = type_cb.currentText()
+
+            label = self.inputs_table.cellWidget(r, 2).text().strip() or None
+
+            default_txt = self.inputs_table.cellWidget(r, 3).text()
+            if default_txt == "":
+                default = None
+            elif itype == "int":
+                try: default = int(default_txt)
+                except: default = 0
+            elif itype == "float":
+                try: default = float(default_txt)
+                except: default = 0.0
+            else:
+                default = default_txt
+
+            choices_txt = self.inputs_table.cellWidget(r, 4).text().strip()
+            choices = [c.strip() for c in choices_txt.split(",")] if (choices_txt and itype in ("enum","multienum")) else None
+            
+
+            # required = self._get_required_checked(r)
+            required = self._get_checkbox_checked(r, 5)
+            readonly = self._get_checkbox_checked(r, 6)
+
+            inputs.append(InputSpec(
+                name=name,
+                type=itype,
+                label=label,
+                default=default,
+                choices=choices,
+                required=required,
+                readonly=readonly
+            ))
+        t = ToolSpec(
+            name=self.name_edit.text().strip() or "Untitled",
+            runner_mode=self.mode_cb.currentText(),
+            runner=self.runner_edit.text().strip(),
+            script=self.script_edit.text().strip() or None,
+            # output_dir_optional=False,
+            inputs=inputs,
+            notes=self.notes_edit.toPlainText().strip() or None
+        )
+        return t
+
+# ---------- Dynamic Form ----------
+# ======== class ToolForm =================================================================
+# =========================================================================================
+class ToolForm(QtWidgets.QWidget):
+    runRequested = QtCore.Signal(dict)  # payload of collected values
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._busy = False
+        self.tool: Optional[ToolSpec] = None
+        self.fields: Dict[str, QtWidgets.QWidget] = {}
+        self.output_dir = QtWidgets.QLineEdit()
+        self.log = QtWidgets.QPlainTextEdit()
+        self.log.setObjectName("LogView") 
+        self.log.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        self.log.setMinimumHeight(220)   # optional
+        try:
+            mono = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
+        except Exception:
+            # Fallbacks (Windows first)
+            for fam in ["Consolas", "Cascadia Mono", "Courier New", "DejaVu Sans Mono", "Menlo", "Monaco"]:
+                if QtGui.QFont(fam).exactMatch():
+                    mono = QtGui.QFont(fam)
+                    break
+            else:
+                mono = self.font()  # last resort
+
+        mono.setPointSize(12)  # tweak to taste
+        self.log.setFont(mono)
+        self.log.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        metrics = QtGui.QFontMetricsF(mono)
+        self.log.setTabStopDistance(4 * metrics.horizontalAdvance(" "))        
+        self.log.setReadOnly(True)
+        self.run_btn = QtWidgets.QPushButton("▶ Run")
+        self.stop_btn = QtWidgets.QPushButton("■ Stop")
+        self.stop_btn.setEnabled(False)
+        self.status = QtWidgets.QLabel("Ready")
+        self.cwd = os.getcwd()
+
+        
+        # In ToolForm.__init__
+        self.run_btn = QtWidgets.QPushButton("Run")
+        self.run_btn.setObjectName("Primary")
+        self.run_btn.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay))
+
+        self.stop_btn = QtWidgets.QPushButton("Stop")
+        self.stop_btn.setObjectName("Danger")
+        self.stop_btn.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_BrowserStop))
+
+        self.run_btn.setMinimumWidth(140)   # 140–180 works nicely
+        self.stop_btn.setMinimumWidth(140)
+        
+        self.run_btn.setStyleSheet("""
+        QPushButton#Primary{
+            background:#ADE4F7;   /* blue */
+            color:black;
+            border:none; border-radius:10px;
+            padding:10px 16px; font-weight:600;
+        }
+        QPushButton#Primary:hover{ background: #80ADE4F7; }  /* #80ADE4F7 */
+        QPushButton#Primary:pressed{ background:#104A91; }
+        QPushButton#Primary:disabled{ background:#D7DEDE; color:rgba(255,255,255,85%); }
+        """)
+
+        self.stop_btn.setStyleSheet("""
+        QPushButton#Danger{
+            background:#ED7272;   /* red */
+            color:black;
+            border:none; border-radius:10px;
+            padding:10px 16px; font-weight:600;
+        }
+        QPushButton#Danger:hover{ background:#80ED7272; }  /*#80ED7272*/
+        QPushButton#Danger:pressed{ background:#b91c1c; }
+        QPushButton#Danger:disabled{ background:#D7DEDE; color:rgba(255,255,255,0.9); }
+        """)
+        
+        # Layout
+        self.form_layout = QtWidgets.QFormLayout()
+        form_box = QtWidgets.QGroupBox("Application Inputs:")
+        form_box.setLayout(self.form_layout)
+        form_box.setStyleSheet("""
+            QGroupBox {
+                border: 2px solid #33BEE8F7;        /*#33BEE8F7*/
+                border-radius: 10px;
+                background:#80BEE8F7;               /* #80BEE8F7 */  
+                margin-top: 24px;                /* push border down */
+                padding-top: 12px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                left: 0px;
+                top: -5px;                      /* move text above border */
+                padding: 0 6px;
+                font-size: 20px;
+                font-weight: 1200;
+                background: transparent;
+            }
+        """)
+
+        
+        self.form_layout.setLabelAlignment(QtCore.Qt.AlignLeft)
+        self.form_layout.setFormAlignment(QtCore.Qt.AlignTop)
+        self.form_layout.setHorizontalSpacing(14)
+        self.form_layout.setVerticalSpacing(10)
+        
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addWidget(self.run_btn)
+        btn_row.addWidget(self.stop_btn)
+        btn_row.addStretch()
+        self.run_btn.clicked.connect(self._on_run)
+        self.stop_btn.clicked.connect(self._on_stop)
+
+        v = QtWidgets.QVBoxLayout(self)
+        
+        
+        title_row = QtWidgets.QHBoxLayout()
+        self.tool_title = QtWidgets.QLabel("<b>No tool selected</b>")
+        self.tool_title.setObjectName("Heading") 
+        font = self.tool_title.font()
+        font.setPointSize(16)        # increase size (try 14–16 for headers)
+        font.setBold(True)           # keep bold
+        self.tool_title.setFont(font)
+        self.tool_title.setAlignment(QtCore.Qt.AlignLeft)  # optional: center it Qt.AlignLeft, Qt.AlignRight, Qt.AlignHCenter, Qt.AlignJustify
+
+        # --- info button (bigger, circular)
+        self.info_btn = QtWidgets.QToolButton()
+        self.info_btn.setObjectName("InfoBtn")
+        self.info_btn.setToolTip("About this tool")
+        self.info_btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self.info_btn.clicked.connect(self._show_tool_info)
+
+        # make it ~2× larger
+        ICON_PX = 30          # icon size (try 28–32)
+        PADDING = 2           # inner padding around the icon
+        SIDE    = ICON_PX + PADDING * 2
+
+        self.info_btn.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_MessageBoxInformation))
+        self.info_btn.setIconSize(QtCore.QSize(ICON_PX, ICON_PX))
+        self.info_btn.setFixedSize(SIDE, SIDE)
+
+        self.info_btn.setStyleSheet(f"""
+        QToolButton#InfoBtn {{
+            
+            color: white;
+            border: none;
+            
+        }}
+        QToolButton#InfoBtn:hover   {{ background: #A7D9FC; }}
+        QToolButton#InfoBtn:pressed {{ background: #83C8F7; }}
+        """)
+
+        
+        title_row.addWidget(self.tool_title)
+        title_row.addStretch()
+        # title_row.addWidget(info_btn)
+        title_row.addWidget(self.info_btn)
+
+
+        v.addLayout(title_row)
+        v.addWidget(form_box)
+        v.addWidget(QtWidgets.QLabel("  Application Logs:"))
+        v.addWidget(self.log, 1)
+        # v.addStretch(0) 
+        v.addLayout(btn_row)
+        v.addWidget(self.status)
+
+        # force stretch distribution: only the Logs area gets extra space
+        v.setStretch(v.indexOf(self.tool_title), 0)
+        v.setStretch(v.indexOf(form_box),       0)        
+        v.setStretch(v.indexOf(self.log),       1)   # <-- grows
+        v.setStretch(v.indexOf(btn_row),        0)
+        v.setStretch(v.indexOf(self.status),    0)
+
+
+        self.runner: Optional[QProcRunner] = None
+
+    def _safe_clear_form_layout(self):
+        lay = self.form_layout
+        while lay.count():
+            item = lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+    
+    def _show_tool_info(self):
+        if not self.tool:
+            QtWidgets.QMessageBox.information(self, "About this tool", "No tool selected.")
+            return
+
+        esc = html.escape
+        t    = self.tool
+        title = esc(t.name or "Untitled tool")
+        notes = esc((t.notes or "—").strip())
+
+        # Build parameters list as HTML
+        items = []
+        iCountParameter = 0
+        for spec in t.inputs:
+            
+            label = esc(spec.label or spec.name)
+            typ   = esc(spec.type or "string")
+            req   = "required" if spec.required else "optional"
+            iCountParameter += 1
+
+            bits = [f"<b>{iCountParameter} : {label}</b> <span style='color:#888;'>[{typ}, {req}]</span>"]
+            if spec.default not in (None, ""):
+                bits.append(f"<div style='margin-left:.1em'><i>Default:</i> {esc(str(spec.default))}</div>")
+            if spec.choices:
+                choices = ", ".join(esc(str(c)) for c in spec.choices)
+                bits.append(f"<div style='margin-left:.1em'><i>Choices:</i> {choices}</div>")
+            if getattr(spec, "placeholder", None):
+                bits.append(f"<div style='margin-left:.1em'><i>Hint:</i> {esc(spec.placeholder)}</div>")
+
+            items.append("<li>" + "".join(bits) + "</li>")            
+
+        params_html = "<ul style='margin:0 0 0 .1em; padding:0'>" + "".join(items) + "</ul>" if items else "—"
+
+        html_body = f"""
+        <div style="font-size: 12pt; font-weight:700; margin-bottom:6px;">{title}</div>
+        <div style="margin:10px 0 4px 0;"><b>Tool information</b></div>
+        <div>{notes}</div>        
+        <div style="margin:8px 0;"><b>Parameters</b></div>
+        {params_html}
+        """
+
+        msg = QtWidgets.QMessageBox(self)
+        msg.setWindowTitle("About this tool")
+        msg.setIcon(QtWidgets.QMessageBox.Information)
+        msg.setTextFormat(QtCore.Qt.RichText)  # ensure HTML is used
+        msg.setText(html_body)
+        # optional: allow selecting/copying text
+        msg.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse | QtCore.Qt.LinksAccessibleByMouse)
+        msg.exec()
+        
+
+    def set_tool(self, tool: ToolSpec):
+        if self._busy:
+            return
+        self._busy = True
+        self.setUpdatesEnabled(False)
+        try:
+            self.tool = tool
+            self.tool_title.setText(f"<b>{tool.name}</b>")
+
+            # SAFE clear
+            self._safe_clear_form_layout()
+            self.fields.clear()
+
+            # ===== build dynamic fields of selected tool, mini app =====
+            
+            iCountParam = 0
+            for spec in tool.inputs:
+                label = spec.label or spec.name
+                
+                w: QtWidgets.QWidget
+                if spec.type == "string":
+                    w = QtWidgets.QLineEdit()
+                    if spec.default is not None: w.setText(str(spec.default))
+                elif spec.type == "int":
+                    w = QtWidgets.QSpinBox(); w.setRange(-10**9, 10**9)
+                    if isinstance(spec.default, int): w.setValue(spec.default)
+                elif spec.type == "float":
+                    w = QtWidgets.QDoubleSpinBox(); w.setRange(-1e12, 1e12); w.setDecimals(6)
+                    if isinstance(spec.default, (int,float)): w.setValue(float(spec.default))
+                elif spec.type == "date":
+                    w = QtWidgets.QDateEdit(); w.setCalendarPopup(True); w.setDisplayFormat("yyyy-MM-dd")
+                    if spec.default:
+                        qd = QtCore.QDate.fromString(str(spec.default), "yyyy-MM-dd")
+                        w.setDate(qd if qd.isValid() else QtCore.QDate.currentDate())
+                    else:
+                        w.setDate(QtCore.QDate.currentDate())
+                elif spec.type == "toggle":
+                    w = QtWidgets.QCheckBox()
+                    d = str(spec.default).strip().lower() if spec.default is not None else ""
+                    w.setChecked(d in ("yes", "true", "on", "1"))
+                elif spec.type == "file":
+                    line = QtWidgets.QLineEdit()
+                    btn  = QtWidgets.QPushButton("...")
+                    cnt  = QtWidgets.QWidget()
+                    h = QtWidgets.QHBoxLayout(cnt); h.setContentsMargins(0,0,0,0)
+                    h.addWidget(line, 1); h.addWidget(btn)
+                    def pick_file(checked=False, le=line):
+                        fn, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select File", le.text() or self.cwd, "All files (*.*)")
+                        if fn: le.setText(fn)
+                    btn.clicked.connect(pick_file)
+                    w = cnt; w._file_line = line
+                elif spec.type == "folder":
+                    line = QtWidgets.QLineEdit()
+                    btn  = QtWidgets.QPushButton("...")
+                    cnt  = QtWidgets.QWidget()
+                    h = QtWidgets.QHBoxLayout(cnt); h.setContentsMargins(0,0,0,0)
+                    h.addWidget(line, 1); h.addWidget(btn)
+                    def pick_folder(checked=False, le=line):
+                        fn = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Folder", le.text() or self.cwd)
+                        if fn: le.setText(fn)
+                    btn.clicked.connect(pick_folder)
+                    w = cnt; w._file_line = line
+                elif spec.type == "enum":
+                    w = QtWidgets.QComboBox()
+                    if spec.choices: w.addItems(spec.choices)
+                    if spec.default is not None:
+                        idx = w.findText(str(spec.default))
+                        if idx >= 0: w.setCurrentIndex(idx)
+                elif spec.type == "multienum":
+                    w = CheckableComboBox()
+                    w.setChoices(spec.choices or [])
+                    defaults = []
+                    if spec.default:
+                        if isinstance(spec.default, str):
+                            defaults = [s.strip() for s in spec.default.split(",") if s.strip()]
+                        elif isinstance(spec.default, (list, tuple)):
+                            defaults = list(spec.default)
+                    w.setCheckedItems(defaults)
+                elif spec.type == "list":
+                    w = QtWidgets.QPlainTextEdit()
+                    w.setPlaceholderText("-")
+                    w.setFixedHeight(100)
+                    w.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+                    if spec.default:
+                        if isinstance(spec.default, str):
+                            w.setPlainText(spec.default)
+                        elif isinstance(spec.default, (list, tuple)):
+                            w.setPlainText("\n".join(map(str, spec.default)))
+                else:
+                    w = QtWidgets.QLineEdit()
+
+                if hasattr(w, "_file_line") and spec.default:
+                    w._file_line.setText(str(spec.default))
+                elif isinstance(w, QtWidgets.QLineEdit) and spec.default is not None:
+                    w.setText(str(spec.default))
+
+                iCountParam += 1
+                
+                self.form_layout.addRow(f'{iCountParam} : {label}' + ("" if not spec.required else " *"), w)
+                self.fields[spec.name] = w
+
+                if getattr(spec, "readonly", False):
+                    if isinstance(w, (QtWidgets.QLineEdit, QtWidgets.QPlainTextEdit)):
+                        w.setReadOnly(True)
+                    elif isinstance(w, QtWidgets.QComboBox):
+                        w.setEnabled(False)
+
+            self.output_dir.setText("")
+            self.log.clear()
+            self.status.setText("Ready")
+        except Exception as e:
+            import traceback
+            tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+            QtWidgets.QMessageBox.critical(self, "Form Build Error", tb)
+        finally:
+            self.setUpdatesEnabled(True)
+            self._busy = False
+            self.update()
+
+
+    def collect_values(self) -> Dict[str, Any]:
+        vals = {}
+        if not self.tool:
+            return vals
+        for spec in self.tool.inputs:
+            w = self.fields.get(spec.name)
+            if not w: continue
+            if spec.type in ("string","file","folder"):
+                if hasattr(w, "_file_line"):
+                    vals[spec.name] = w._file_line.text().strip()
+                else:
+                    vals[spec.name] = w.text().strip()
+            elif spec.type == "int":
+                vals[spec.name] = int(w.value())
+            elif spec.type == "float":
+                vals[spec.name] = float(w.value())
+            elif spec.type == "enum":
+                vals[spec.name] = w.currentText()
+            elif spec.type == "multienum":
+                vals[spec.name] = ",".join(self.fields[spec.name].checkedItems())
+            elif spec.type == "date":
+                vals[spec.name] = w.date().toString("yyyy-MM-dd")
+            elif spec.type == "toggle":
+                vals[spec.name] = w.isChecked()
+            elif spec.type == "list":
+                lines = [ln.strip() for ln in w.toPlainText().splitlines() if ln.strip()]
+                vals[spec.name] = ",".join(lines)   # e.g. "alpha,beta,gamma"
+
+            else:
+                vals[spec.name] = str(w.text()).strip()
+        vals["_output_dir"] = self.output_dir.text().strip() or None
+        return vals
+
+    def _on_run(self):
+        if not self.tool:
+            return
+        vals = self.collect_values()
+        for spec in self.tool.inputs:
+            if spec.required:
+                v = vals.get(spec.name, "")
+                if v in (None, "", []):
+                    QtWidgets.QMessageBox.warning(self, "Missing Input", f"'{spec.label or spec.name}' is required.")
+                    return
+        try:
+            cmd = self._build_command(self.tool, vals)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Build Error", str(e))
+            return
+
+        self.status.setText("Running...")
+        self.run_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        
+        self._pending_cmd = cmd
+        QtCore.QTimer.singleShot(0, self._start_run)
+
+    def _start_run(self):
+        cmd = getattr(self, "_pending_cmd", None)
+        if not cmd:
+            return
+
+        # Do NOT force cwd changes — inherit current app CWD
+        # If you want to pass env, do env = os.environ.copy()
+        self.runner = QProcRunner(self)
+        self.runner.lineReady.connect(lambda s: self.log.appendPlainText(s))
+        self.runner.finished.connect(self._on_finished)
+        
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"     # unbuffer stdout/stderr
+        env["PYTHONIOENCODING"] = "utf-8" # good for non-ASCII output
+        
+        # self.runner.start(cmd, cwd=None)   # keep current working directory
+        self.runner.start(cmd, cwd=None, env=env) 
+
+    def _on_stop(self):
+        if self.runner:
+            self.runner.kill()
+        self.status.setText("Stopping...")
+
+    def _on_finished(self, code: int):
+        self.status.setText(f"Finished with code {code}")
+        self.run_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.runner = None
+
+
+    def _build_command(self, tool: ToolSpec, vals: Dict[str, Any]) -> List[str]:
+        
+        
+        
+        py = sys.executable.replace(chr(92), chr(47))
+        
+        if not os.path.isfile(py):
+            raise ValueError("Python service not found: " + py)
+
+        toggle_names = {i.name for i in tool.inputs if i.type == "toggle"}
+        # Provide a common placeholder dictionary
+        placeholders = {
+            **vals, 
+            "python": py, 
+            "python_u": f"{py} -u", 
+            "script": tool.script or "",
+            "output_dir": (vals.get("_output_dir") or "")}
+
+        # Extra toggle-friendly placeholders
+        for k in toggle_names:
+            on = bool(vals.get(k))
+            placeholders[f"{k}_flag"] = f"--{k}" if on else f"--no-{k}"
+            placeholders[f"{k}_yn"]   = "yes" if on else "no"
+            placeholders[f"{k}_01"]   = "1" if on else "0"
+        
+        if tool.runner_mode == "module":
+            # python -m pkg.module --func function_name --k v ...
+            mod, func = parse_module_runner(tool.runner)
+            # cmd = [py, "-m", mod, "--func", func]
+            cmd = [py, "-u", "-m", mod, "--func", func]
+
+            # add inputs as --key value
+            for k, v in vals.items():
+                if k == "_output_dir": continue
+                cmd += [f"--{k}", str(v)]
+            if vals.get("_output_dir"):
+                cmd += ["--output_dir", vals["_output_dir"]]
+            return cmd
+
+        elif tool.runner_mode == "command":
+            # command template, e.g.: "{python} {script} --in {images} --mode {mode} --out {output_dir}"
+            if not tool.runner:
+                raise ValueError("Command template is empty.")
+            # string substitute
+            try:
+                templ = tool.runner.format(**placeholders)
+            except KeyError as e:
+                raise ValueError(f"Missing placeholder in template: {e}")
+            # shlex split to list
+            return shlex.split(templ)
+        else:
+            raise ValueError("Unknown runner_mode: " + tool.runner_mode)
+
+#-------------- combo box with icons --------------
+# ======== class CheckableComboBox ========================================================
+# =========================================================================================
+class CheckableComboBox(QtWidgets.QComboBox):
+    """Multi-select dropdown with checkmarks + one-line summary, aligned popup."""
+    changed = QtCore.Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setView(QtWidgets.QListView())
+        self.setModel(QtGui.QStandardItemModel(self))
+
+        # Use editable line edit to control the displayed text ourselves
+        self.setEditable(True)
+        self.lineEdit().setReadOnly(True)
+        self.lineEdit().setPlaceholderText("— select —")
+        self.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+
+        # Show more items when open
+        self.setMaxVisibleItems(14)
+
+        # Toggle items on click
+        self.view().pressed.connect(self._toggle_item)
+
+        # Keep the summary in sync when model changes in any way
+        self.model().dataChanged.connect(self._update_text)
+        self.model().rowsInserted.connect(self._update_text)
+        self.model().rowsRemoved.connect(self._update_text)
+        self.currentIndexChanged.connect(self._update_text)
+
+        # Avoid built-in text overriding our summary
+        self.setCurrentIndex(-1)
+
+    # ----- public API
+    def setChoices(self, choices):
+        self.model().clear()
+        for text in (choices or []):
+            it = QtGui.QStandardItem(str(text))
+            it.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsUserCheckable)
+            it.setData(QtCore.Qt.Unchecked, QtCore.Qt.CheckStateRole)
+            self.model().appendRow(it)
+        self._update_text()
+
+    def setCheckedItems(self, items):
+        want = set(map(str, items or []))
+        for row in range(self.model().rowCount()):
+            it = self.model().item(row)
+            it.setCheckState(QtCore.Qt.Checked if it.text() in want else QtCore.Qt.Unchecked)
+        self._update_text()
+
+    def checkedItems(self):
+        out = []
+        for row in range(self.model().rowCount()):
+            it = self.model().item(row)
+            if it.checkState() == QtCore.Qt.Checked:
+                out.append(it.text())
+        return out
+
+    # ----- internals
+    def _toggle_item(self, idx: QtCore.QModelIndex):
+        it = self.model().itemFromIndex(idx)
+        it.setCheckState(QtCore.Qt.Unchecked if it.checkState() == QtCore.Qt.Checked
+                         else QtCore.Qt.Checked)
+        self._update_text()
+        self.changed.emit()
+
+    def _update_text(self):
+        sel = self.checkedItems()
+        full = ", ".join(sel) if sel else "— none —"
+
+        # one-line summary: first 20, then (+N)
+        MAX_SHOW = 20
+        display = full if len(sel) <= MAX_SHOW else ", ".join(sel[:MAX_SHOW]) + f" (+{len(sel)-MAX_SHOW})"
+
+        # elide to widget width
+        fm = self.lineEdit().fontMetrics()
+        elided = fm.elidedText(display, QtCore.Qt.ElideRight, max(60, self.width() - 28))
+        self.lineEdit().setText(elided)
+        self.setToolTip(full)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._update_text()  # keep eliding correct on resize
+
+    def showPopup(self):
+        super().showPopup()
+        # Make popup the same width and aligned under the combo (no shift)
+        popup = self.view().window()  # QFrame created by QComboBox
+        # popup.setFixedWidth(self.width())
+        popup.setFixedWidth(int(self.width() * 1.15))
+        popup.move(self.mapToGlobal(QtCore.QPoint(0, self.height())))
+
+
+# ---------- Main Window ----------
+# ======== class MainWindow ===============================================================
+# =========================================================================================
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self, tools: List[ToolSpec]):
+        super().__init__()
+        self.setWindowTitle(APP_TITLE)
+        self.resize(1100, 700)
+        self.tools: List[ToolSpec] = tools
+        
+        self._select_timer = QtCore.QTimer()
+        self._select_timer.setSingleShot(True)
+        self._select_timer.timeout.connect(self._apply_selection)
+
+        # Left: tools list
+        self.list = QtWidgets.QListWidget()
+        self.list.itemSelectionChanged.connect(self._on_select)
+        self.list.setMinimumWidth(260)
+        self.list.setAlternatingRowColors(True)
+        self.list.setSpacing(2)
+        
+        # NEW: tame selection spam & double-clicks
+        self.list.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.list.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.list.installEventFilter(self)
+
+        self._last_applied_row = -1     # remember last row we actually built
+        
+        self.list.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.list.customContextMenuRequested.connect(self._show_list_menu)
+
+        font = self.list.font()
+        font.setPointSize(11)          # try 13–15
+        # font.setBold(True)             # optional
+        self.list.setFont(font)
+        
+        
+        self._reload_list()
+
+        # Right: form
+        self.form = ToolForm()
+
+        # ===== Menu Bar =====
+        mb = self.menuBar()
+        
+        
+        # bump menu fonts
+        f = mb.font()
+        f.setPointSize(f.pointSize() + 2)   # or: f.setPointSize(12)
+        mb.setFont(f)
+
+        mb.setStyleSheet("""
+        QMenuBar {
+            background: #f3f4f6;
+            border-bottom: 1px solid rgba(0,0,0,0.15);
+            padding: 4px 8px;
+            font-size: 12pt; 
+        }
+        QMenuBar::item {
+            padding: 4px 10px;
+            font-weight: 600;
+            color: #222;
+            background: transparent;
+        }
+        QMenuBar::item:selected { background: rgba(37, 99, 235, 0.12); border-radius: 6px; }
+        QMenu { background: #ffffff; border: 1px solid #ddd; padding: 6px 0; font-size: 12pt; }
+        QMenu::item { padding: 6px 14px; }
+        QMenu::item:selected { background: rgba(37, 99, 235, 0.12); }
+        """)
+        
+        # ---- Actions (create FIRST)
+        add_act   = QtGui.QAction("Add Tool", self);    add_act.triggered.connect(self._add_tool)
+        edit_act  = QtGui.QAction("Edit Tool", self);   edit_act.triggered.connect(self._edit_tool)
+        dup_act   = QtGui.QAction("Duplicate", self);   dup_act.triggered.connect(self._dup_tool)
+        del_act   = QtGui.QAction("Delete", self);      del_act.triggered.connect(self._del_tool)
+        save_act  = QtGui.QAction("Save Config", self); save_act.triggered.connect(self._save)
+        load_cfg_act = QtGui.QAction("Load Config File…", self)
+        
+        
+        # optional shortcuts
+        add_act.setShortcut("Ctrl+N")
+        edit_act.setShortcut("Ctrl+E")
+        dup_act.setShortcut("Ctrl+D")
+        del_act.setShortcut("Del")
+        load_cfg_act.setShortcut("Ctrl+L") 
+
+        # # --- Theme menu (stable switching) ---
+        # theme_menu = mb.addMenu("Theme")
+
+        # act_theme_light = QtGui.QAction("Light", self, checkable=True)
+        # act_theme_dark  = QtGui.QAction("Dark",  self, checkable=True)
+        # act_theme_auto  = QtGui.QAction("Auto (follow system)", self, checkable=True)
+        # theme_group = QtGui.QActionGroup(self)
+        # for a in (act_theme_light, act_theme_dark, act_theme_auto):
+        #     a.setActionGroup(theme_group)
+        # theme_menu.addActions([act_theme_light, act_theme_dark, act_theme_auto])
+
+        # # load current mode to set the checked state
+        # cur_mode = QtCore.QSettings("PlarApp", "LocalAppRunner").value("theme", "auto")
+        # (act_theme_light if cur_mode=="light" else act_theme_dark if cur_mode=="dark" else act_theme_auto).setChecked(True)
+
+        # act_theme_light.triggered.connect(lambda: self._switch_theme("light"))
+        # act_theme_dark.triggered.connect(lambda: self._switch_theme("dark"))
+        # act_theme_auto.triggered.connect(lambda: self._switch_theme("auto"))
+
+        
+        load_cfg_act.triggered.connect(self._load_config_file)
+        
+
+        # ---- Menus (add actions AFTER they exist)
+        m_tools = mb.addMenu("Tools")
+        m_tools.addAction(add_act)
+        m_tools.addAction(edit_act)
+        m_tools.addAction(dup_act)
+        m_tools.addSeparator()
+        m_tools.addAction(del_act)
+        m_tools.addSeparator()
+        m_tools.addAction(load_cfg_act)
+
+        m_file = mb.addMenu("File")
+        m_file.addAction(save_act)
+
+        # Central splitter
+        splitter = QtWidgets.QSplitter()
+        splitter.addWidget(self.list)
+        splitter.addWidget(self.form)
+        splitter.setSizes([320, 900])     # initial widths for [left, right]
+        splitter.setStretchFactor(0, 0)   # left pane doesn’t auto-grow
+        splitter.setStretchFactor(1, 1)   # right pane takes extra space
+        
+        # In MainWindow.__init__ after creating splitter
+        splitter.setHandleWidth(6)
+        margins = 12
+        central = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(central)
+        lay.setContentsMargins(margins, margins, margins, margins)
+        lay.addWidget(splitter)
+        self.setCentralWidget(central)
+        
+        
+        # smoother divider drag (less repaint work)
+        splitter.setOpaqueResize(False)
+
+        # coalesced resize guard
+        self._resizing = False
+        self._resize_coalesce = QtCore.QTimer(self)
+        self._resize_coalesce.setSingleShot(True)
+        self._resize_coalesce.setInterval(140)  # 120–180ms feels good
+        self._resize_coalesce.timeout.connect(self._end_resize)
+
+        self.statusBar().showMessage("Ready")
+
+        if self.list.count() > 0:
+            self.list.setCurrentRow(0)
+
+    def resizeEvent(self, event):
+        # On first tick of a resize burst, freeze heavy widgets only
+        if not self._resizing:
+            self._resizing = True
+            # freeze only the expensive area, not the whole window
+            self.form.setUpdatesEnabled(False)
+            self.form.log.setUpdatesEnabled(False)
+        # restart the coalescing timer on every tick
+        self._resize_coalesce.start()
+        super().resizeEvent(event)
+
+    def _end_resize(self):
+        # re-enable updates once user pauses
+        self.form.log.setUpdatesEnabled(True)
+        self.form.setUpdatesEnabled(True)
+        self._resizing = False
+        # one clean repaint
+        self.form.update()
+    def eventFilter(self, obj, ev):
+        if obj is self.list and ev.type() == QtCore.QEvent.MouseButtonDblClick:
+            return True  # swallow double-clicks; we only want single selection changes
+        return super().eventFilter(obj, ev)
+    
+    def _current_tool_index(self) -> int:
+        idx = self.list.currentRow()
+        return idx if 0 <= idx < len(self.tools) else -1
+
+    def _run_selected(self):
+        # Just trigger the form’s run (only if there’s a tool selected)
+        if self._current_tool_index() >= 0:
+            self.form._on_run()
+
+    def _move_tool(self, delta: int):
+        """Move selected tool up/down by delta (+1 / -1)."""
+        idx = self._current_tool_index()
+        if idx < 0:
+            return
+        new_idx = idx + delta
+        if not (0 <= new_idx < len(self.tools)):
+            return
+        self.tools[idx], self.tools[new_idx] = self.tools[new_idx], self.tools[idx]
+        self._reload_list()
+        self.list.setCurrentRow(new_idx)
+        self._save(silent=True)
+
+    def _show_list_menu(self, pos: QtCore.QPoint):
+        item = self.list.itemAt(pos)
+        has_item = item is not None
+        global_pos = self.list.mapToGlobal(pos)
+
+        s = self.style()
+        menu = QtWidgets.QMenu(self)
+
+        # Top actions (item-specific)
+        act_run  = menu.addAction(s.standardIcon(QtWidgets.QStyle.SP_MediaPlay), "Run", self._run_selected)
+        act_info = menu.addAction(s.standardIcon(QtWidgets.QStyle.SP_MessageBoxInformation), "Info", 
+                                lambda: self.form._show_tool_info() if has_item else None)
+        menu.addSeparator()
+
+        act_add  = menu.addAction(s.standardIcon(QtWidgets.QStyle.SP_FileDialogNewFolder), "Add Tool", self._add_tool)
+        act_edit = menu.addAction(s.standardIcon(QtWidgets.QStyle.SP_FileDialogDetailedView), "Edit Tool", self._edit_tool)
+        act_dup  = menu.addAction(s.standardIcon(QtWidgets.QStyle.SP_DialogOkButton), "Duplicate", self._dup_tool)
+        act_del  = menu.addAction(s.standardIcon(QtWidgets.QStyle.SP_TrashIcon), "Delete", self._del_tool)
+        menu.addSeparator()
+
+        act_up   = menu.addAction("Move Up",   lambda: self._move_tool(-1))
+        act_down = menu.addAction("Move Down", lambda: self._move_tool(+1))
+        menu.addSeparator()
+
+        act_save = menu.addAction("Save Config", self._save)
+
+        # Enable/disable depending on whether we clicked an item
+        for a in (act_run, act_info, act_edit, act_dup, act_del, act_up, act_down):
+            a.setEnabled(has_item)
+
+        # Show the menu
+        menu.exec(global_pos)
+    
+    def _reload_list(self):
+        self.list.clear()
+        for t in self.tools:
+            item = QtWidgets.QListWidgetItem(t.name)
+            item.setData(QtCore.Qt.UserRole, t)
+            self.list.addItem(item)
+
+    def _on_select(self):
+        self._select_timer.start(150)
+
+    def _apply_selection(self):
+        idx = self.list.currentRow()
+        if idx < 0 or idx >= len(self.tools):
+            self.form.set_tool(ToolSpec(name=""))
+            self._last_applied_row = -1
+            return
+
+        # Ignore redundant selection (prevents unnecessary rebuilds)
+        if idx == self._last_applied_row:
+            return
+
+        self.list.setEnabled(False)
+        try:
+            tool = self.tools[idx]
+            # Queue the heavy rebuild to the next event-loop turn (avoids re-entrancy)
+            QtCore.QTimer.singleShot(0, lambda t=tool: self.form.set_tool(t))
+            self._last_applied_row = idx
+
+            # Bold highlight for the selected one
+            for i in range(self.list.count()):
+                it = self.list.item(i)
+                f = it.font()
+                f.setBold(i == idx)
+                it.setFont(f)
+        finally:
+            # Re-enable slightly later so pending paints finish first
+            QtCore.QTimer.singleShot(120, lambda: self.list.setEnabled(True))
+
+    
+    def _add_tool(self):
+        dlg = ToolEditor(self)
+        if dlg.exec() == QtWidgets.QDialog.Accepted:
+            t = dlg.result_tool()
+            self.tools.append(t)
+            self._reload_list()
+            self._save(silent=True)
+
+    def _edit_tool(self):
+        items = self.list.selectedItems()
+        if not items: return
+        idx = self.list.currentRow()
+        cur = self.tools[idx]
+        
+        dlg = ToolEditor(self, cur)
+        if dlg.exec() == QtWidgets.QDialog.Accepted:
+            self.tools[idx] = dlg.result_tool()
+            self._reload_list()
+            self._last_applied_row = -1            # <-- allow rebuild on same row
+            self.list.setCurrentRow(idx)
+            # also refresh the right pane immediately so the new 'required' flags apply
+            QtCore.QTimer.singleShot(0, lambda: self.form.set_tool(self.tools[idx]))
+            self._save(silent=True)
+
+    def _dup_tool(self):
+        items = self.list.selectedItems()
+        if not items: return
+        idx = self.list.currentRow()
+        base = self.tools[idx]
+        clone = ToolSpec(
+            name=base.name + " (copy)",
+            runner_mode=base.runner_mode,
+            runner=base.runner,
+            script=base.script,
+            # output_dir_optional=base.output_dir_optional,
+            output_dir_optional=False,
+            inputs=[InputSpec(**i.__dict__) for i in base.inputs],
+            notes=base.notes
+        )
+        self.tools.append(clone)
+        self._reload_list()
+        self.list.setCurrentRow(self.list.count()-1)
+        self._save(silent=True)
+
+    def _del_tool(self):
+        items = self.list.selectedItems()
+        if not items: return
+        idx = self.list.currentRow()
+        name = self.tools[idx].name
+        if QtWidgets.QMessageBox.question(self, "Delete", f"Delete tool '{name}'?") == QtWidgets.QMessageBox.Yes:
+            del self.tools[idx]
+            self._reload_list()
+            self._save(silent=True)
+
+    def _save(self, silent=False):
+        save_config(CONFIG_FILE, self.tools)
+        if not silent:
+            QtWidgets.QMessageBox.information(self, "Saved", f"Saved to {CONFIG_FILE}")
+    
+    def _load_config_file(self):
+        """Pick a JSON file and overwrite CONFIG_FILE, then reload list/UI."""
+        fn, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select Tools Config (JSON)", "", "JSON files (*.json);;All files (*.*)"
+        )
+        if not fn:
+            return
+
+        try:
+            # Validate JSON first so we don't clobber current file with bad data
+            with open(fn, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, list):
+                raise ValueError("Config must be a JSON array of tools.")
+
+            # Overwrite the active config file directly
+            with open(CONFIG_FILE, "w", encoding="utf-8") as out:
+                json.dump(data, out, indent=2, ensure_ascii=False)
+
+            # Reload into the app
+            self.tools = load_config(CONFIG_FILE)
+            self._reload_list()
+            if self.list.count() > 0:
+                self.list.setCurrentRow(0)
+
+            QtWidgets.QMessageBox.information(
+                self, "Config Loaded",
+                f"Replaced and reloaded config from:\n{fn}"
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, "Load Failed",
+                f"Could not load config:\n{e}"
+            )
+
+    def _switch_theme(self, mode: str):
+        app = QtWidgets.QApplication.instance()
+        if not app:
+            return
+
+        apply_modern_theme(app, mode)
+        app.setStyle("Fusion")  # stable base
+
+        style = app.style()
+        for w in app.allWidgets():
+            style.unpolish(w)
+            style.polish(w)
+            # ---- SAFE refresh that avoids QListWidget.update(index) overload
+            if isinstance(w, QtWidgets.QAbstractItemView):
+                # views repaint their viewport
+                w.viewport().update()
+            else:
+                try:
+                    QtWidgets.QWidget.update(w)  # call QWidget::update explicitly
+                except TypeError:
+                    w.repaint()  # final fallback
+
+        dark = is_dark_palette(app.palette())   # helper you already have
+        for tb in self.findChildren(QtWidgets.QToolBar):
+            style_toolbar(tb, dark)             # uses your dark/light CSS
+        
+        QtCore.QSettings("PlarApp", "LocalAppRunner")
+        if self.statusBar():
+            self.statusBar().showMessage(f"Theme: {mode}", 2000)
+
+
+# --- Modern theme (light/dark) helpers ---
+def apply_modern_theme(app: QtWidgets.QApplication, mode: str = "light"):
+    """
+    mode: 'light' | 'dark' | 'auto'
+    """
+    if mode == "auto":
+        # follow Windows setting if available; fallback to light
+        mode = "dark" if QtGui.QGuiApplication.palette().color(QtGui.QPalette.Window).value() < 128 else "light"
+
+    app.setStyle("Fusion")  # stable + themeable
+
+    # Typography
+    base = app.font()
+    base.setFamily("Segoe UI")
+    base.setPointSize(11)       # comfortable default
+    app.setFont(base)
+
+    pal = QtGui.QPalette()
+
+    if mode == "dark":
+        # Windows 11-ish dark palette
+        bg   = QtGui.QColor(32, 32, 36)
+        card = QtGui.QColor(42, 42, 48)
+        txt  = QtGui.QColor(230, 230, 235)
+        sub  = QtGui.QColor(180, 182, 188)
+        acc  = QtGui.QColor("#ADE4F7")  # primary accent (Win11 blue-ish)
+
+        pal.setColor(QtGui.QPalette.Window, bg)
+        pal.setColor(QtGui.QPalette.Base, card)
+        pal.setColor(QtGui.QPalette.AlternateBase, bg.darker(110))
+        pal.setColor(QtGui.QPalette.ToolTipBase, card)
+        pal.setColor(QtGui.QPalette.ToolTipText, txt)
+        pal.setColor(QtGui.QPalette.Text, txt)
+        pal.setColor(QtGui.QPalette.Button, card)
+        pal.setColor(QtGui.QPalette.ButtonText, txt)
+        pal.setColor(QtGui.QPalette.Highlight, acc)
+        pal.setColor(QtGui.QPalette.HighlightedText, QtCore.Qt.black)
+        pal.setColor(QtGui.QPalette.PlaceholderText, sub)
+        pal.setColor(QtGui.QPalette.WindowText, txt)
+    else:
+        # Light palette
+        bg   = QtGui.QColor(246, 246, 248)
+        card = QtGui.QColor(255, 255, 255)
+        txt  = QtGui.QColor(24, 24, 28)
+        sub  = QtGui.QColor(110, 113, 120)
+        acc  = QtGui.QColor("#ADE4F7")
+
+        pal.setColor(QtGui.QPalette.Window, bg)
+        pal.setColor(QtGui.QPalette.Base, QtGui.QColor(250, 250, 251))
+        pal.setColor(QtGui.QPalette.AlternateBase, QtGui.QColor(244, 244, 246))
+        pal.setColor(QtGui.QPalette.ToolTipBase, card)
+        pal.setColor(QtGui.QPalette.ToolTipText, txt)
+        pal.setColor(QtGui.QPalette.Text, txt)
+        pal.setColor(QtGui.QPalette.Button, card)
+        pal.setColor(QtGui.QPalette.ButtonText, txt)
+        pal.setColor(QtGui.QPalette.Highlight, acc)
+        pal.setColor(QtGui.QPalette.HighlightedText, QtCore.Qt.black)
+        pal.setColor(QtGui.QPalette.PlaceholderText, sub)
+        pal.setColor(QtGui.QPalette.WindowText, txt)
+
+    app.setPalette(pal)
+
+    # Global stylesheet (rounded corners, card group boxes, nicer fields & buttons)
+    app.setStyleSheet("""
+        /* Headings */
+        QLabel#Heading {
+            font-size: 18px;
+            font-weight: 700;
+            padding: 4px 0 10px 0;
+        }
+
+        /* Left tool list */
+        QListWidget {
+            border: none;
+            padding: 8px;
+            outline: none;
+            background-color: #80BEE8F7 ;        /* #80BEE8F7  transparent with slight tint blue */
+        }
+        QListWidget::item {
+            padding: 8px 10px;
+            border-radius: 8px;
+            margin: 2px 0;
+            background-color: #33BEE8F7;        /*  #33BEE8F7  transparent with slight tint blue */
+        }
+        QListWidget::item:selected {
+            background: #ADE4F7;
+            color: black;
+        }
+        QListView {
+            padding: 4px 6px;
+        }
+        QListView::item {
+            padding: 4px 6px;
+        }
+
+        /* Card group */
+        QGroupBox {
+            background: palette(Base);
+            border: 1px solid rgba(0,0,0,25%);
+            border-radius: 12px;
+            margin-top: 18px;
+            padding: 12px 12px 8px 12px;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            left: 12px;
+            top: 6px;
+            padding: 0 6px;
+            background: transparent;
+            font-weight: 600;
+        }
+
+        /* Form spacing */
+        QFormLayout > * {
+            margin-top: 6px;
+            margin-bottom: 6px;
+        }
+        QLabel {
+            color: palette(WindowText);
+        }
+
+        /* Inputs */
+        QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QPlainTextEdit {
+            border: 1px solid rgba(0,0,0,25%);
+            border-radius: 8px;
+            padding: 6px 8px;
+            background: palette(Base);
+        }
+        QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QPlainTextEdit:focus {
+            border: 2px solid palette(Highlight);
+        }
+
+        /* Buttons */
+        QPushButton {
+            border: 1px solid rgba(0,0,0,16%);
+            border-radius: 10px;
+            padding: 8px 14px;
+            font-weight: 600;
+            background: palette(Button);
+        }
+        QPushButton:hover {
+            border-color: rgba(0,0,0,28%);
+        }
+        QPushButton#Primary {
+            background: palette(Highlight);
+            color: white;
+            border: none;
+        }
+        QPushButton#Danger {
+            background: #ed4c4c;
+            color: white;
+            border: none;
+        }
+
+        /* Logs */
+        QPlainTextEdit#LogView {
+            border-radius: 10px;
+            border: 1px solid rgba(0,0,0,20%);
+            padding: 8px;
+            background: palette(Base);
+        }
+
+        /* Toolbar */
+        QToolBar {
+            border: none;
+            padding: 6px;
+            spacing: 8px;
+        }
+        
+        QGroupBox {
+            border: none;
+            background: transparent;
+        }
+        QFormLayout QLabel {
+            font-size: 13px;
+            color: #555;
+            padding-bottom: 2px;
+        }
+        QLineEdit, QComboBox, QTextEdit {
+            border: none;
+            border-bottom: 2px solid rgba(0,0,0,0.15);
+            border-radius: 0;
+            padding: 4px;
+            background: transparent;
+        }
+        QLineEdit:focus, QComboBox:focus {
+            border-bottom: 2px solid #1c2121; 
+        }
+        
+        QGroupBox QLineEdit,
+        QGroupBox QComboBox,
+        QGroupBox QSpinBox,
+        QGroupBox QDoubleSpinBox,
+        QGroupBox QPlainTextEdit,
+        QGroupBox QDateEdit {
+            background: #ffffff;
+            border: 1px solid rgba(0,0,0,0.25);
+            border-radius: 8px;
+            padding: 6px 8px;
+        }
+
+        /* Softer look for read-only / disabled */
+        QGroupBox QLineEdit[readOnly="true"],
+        QGroupBox QPlainTextEdit[readOnly="true"],
+        QGroupBox QComboBox:disabled,
+        QGroupBox QSpinBox:disabled,
+        QGroupBox QDoubleSpinBox:disabled,
+        QGroupBox QDateEdit:disabled {
+            background: #f3f3f3;
+        }
+        
+        
+        /* --- Force BLACK text for controls inside the Inputs group --- */
+        QGroupBox QLineEdit,
+        QGroupBox QPlainTextEdit,
+        QGroupBox QSpinBox,
+        QGroupBox QDoubleSpinBox,
+        QGroupBox QDateEdit,
+        QGroupBox QComboBox {
+            color: #000000;
+        }
+
+        /* ComboBox popup list items */
+        QGroupBox QComboBox QAbstractItemView {
+            color: #000000;
+            background: #ffffff;
+        }
+
+        /* Editable/summary text inside (e.g., your CheckableComboBox uses a line edit) */
+        QGroupBox QComboBox QLineEdit {
+            color: #000000;
+            background: transparent;   /* keep your white field from parent */
+        }
+
+        /* Keep read-only fields black too */
+        QGroupBox QLineEdit[readOnly="true"],
+        QGroupBox QPlainTextEdit[readOnly="true"] {
+            color: #000000;
+        }
+
+        
+    """)
+
+    
+    popup_css = """
+        /* ===== Popups (unified light blue look) ===== */
+        QMessageBox, QInputDialog, QColorDialog, QFontDialog, QFileDialog {
+            background: #ffffff;
+        }
+
+        QMessageBox QLabel, QInputDialog QLabel, QFileDialog QLabel {
+            color: #1f2937;
+            font-size: 12pt;
+        }
+
+        QMessageBox QPushButton, QInputDialog QPushButton, QFileDialog QPushButton, 
+        QColorDialog QPushButton, QFontDialog QPushButton {
+            background: #ADE4F7;
+            color: black;
+            border: none;
+            border-radius: 8px;
+            padding: 6px 12px;
+            font-weight: 600;
+        }
+        QMessageBox QPushButton:hover, QInputDialog QPushButton:hover, QFileDialog QPushButton:hover,
+        QColorDialog QPushButton:hover, QFontDialog QPushButton:hover {
+            background: #93D8F3;
+        }
+
+        /* File dialog lists/edits */
+        QFileDialog QListView, QFileDialog QTreeView, QFileDialog QLineEdit {
+            background: #ffffff;
+            color: #1f2937;
+            border: 1px solid rgba(0,0,0,0.2);
+            border-radius: 6px;
+        }
+
+        /* Tooltips: soft light-blue */
+        QToolTip {
+            background: #E6F6FE;
+            color: #111827;
+            border: 1px solid #BEE8F7;
+            padding: 6px 8px;
+            border-radius: 6px;
+        }
+
+        /* Menus inside dialogs */
+        QMenu {
+            background: #ffffff;
+            border: 1px solid rgba(0,0,0,0.15);
+        }
+        QMenu::item {
+            padding: 6px 12px;
+            border-radius: 6px;
+        }
+        QMenu::item:selected {
+            background: #E6F6FE;
+            color: #111827;
+        }
+        """
+        # Append to the existing global stylesheet (don’t overwrite it)
+    app.setStyleSheet(app.styleSheet() + popup_css)
+
+def is_dark_palette(pal: QtGui.QPalette) -> bool:
+    bg = pal.color(QtGui.QPalette.Window)
+    # luminance check
+    return (0.2126*bg.redF() + 0.7152*bg.greenF() + 0.0722*bg.blueF()) < 0.5
+
+def set_readable_selection(app: QtWidgets.QApplication):
+    pal = app.palette()
+    if is_dark_palette(pal):
+        pal.setColor(QtGui.QPalette.HighlightedText, QtGui.QColor("white"))
+        pal.setColor(QtGui.QPalette.Highlight, QtGui.QColor("#3a63b8"))
+    else:
+        pal.setColor(QtGui.QPalette.HighlightedText, QtGui.QColor("black"))
+        pal.setColor(QtGui.QPalette.Highlight, QtGui.QColor("#cde2ff"))
+    app.setPalette(pal)
+
+def style_toolbar(tb: QtWidgets.QToolBar, dark: bool):
+    if not tb:
+        return
+    if dark:
+        tb.setStyleSheet("""
+            QToolBar { background:#202124; border-bottom:1px solid rgba(255,255,255,0.1); padding:4px 8px; spacing:6px; }
+            QToolButton { background:transparent; border:none; padding:4px 10px; font-weight:600; color:#eaeaea; }
+            QToolButton:hover { background:rgba(255,255,255,0.08); border-radius:6px; }
+            QToolButton:pressed { background:rgba(255,255,255,0.18); border-radius:6px; }
+        """)
+    else:
+        tb.setStyleSheet("""
+            QToolBar { background:#f3f4f6; border-bottom:1px solid rgba(0,0,0,0.15); padding:4px 8px; spacing:6px; }
+            QToolButton { background:transparent; border:none; padding:4px 10px; font-weight:600; color:#222; }
+            QToolButton:hover { background:rgba(37,99,235,0.12); border-radius:6px; }
+            QToolButton:pressed { background:rgba(37,99,235,0.25); color:white; border-radius:6px; }
+        """)
+
+
+def normalize_font_weights(widget: QtWidgets.QWidget):
+    """Clamp all descendant widget font weights to the valid 1..1000 range."""
+    for w in widget.findChildren(QtWidgets.QWidget):
+        f: QtGui.QFont = w.font()
+        wt = f.weight()
+        if wt < 1:
+            f.setWeight(1)
+            w.setFont(f)
+        elif wt > 1000:
+            # pick a sane, readable weight
+            f.setWeight(QtGui.QFont.Weight.DemiBold)  # 600
+            w.setFont(f)
+
+def _qt_msg_filter(mode, ctx, msg):
+    # Drop the noisy font-weight warning (harmless)
+    if 'QFont::setWeight' in msg:
+        return
+    # Forward everything else
+    sys.stderr.write(msg + '\n')
+
+QtCore.qInstallMessageHandler(_qt_msg_filter)
+
+def APP_DIR() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).resolve().parents[1]
+
+CONFIG_FILE = str(APP_DIR() / "msrc" / "tools_config.json")
+APP_TITLE   = "PLAR : Python Local App Runner [-_-']"
+
+def main():
+    os.chdir(APP_DIR())
+    app = QtWidgets.QApplication(sys.argv)
+    apply_modern_theme(app, mode='light') #Theme settings failed >_<, use only light for now.
+
+    tools = load_config(CONFIG_FILE)
+    
+    def _show_crash_box(exctype, value, tb):
+        import traceback
+        msg = "".join(traceback.format_exception(exctype, value, tb))
+        QtWidgets.QMessageBox.critical(None, "Unhandled Error", msg)
+
+    w = MainWindow(tools)
+    w.show()
+    sys.excepthook = _show_crash_box   # <-- add this line
+       
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()
+
+# ---- the end, my first public repo ----

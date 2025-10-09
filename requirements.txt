@@ -1,0 +1,4 @@
+PyPDF2==3.0.1
+pyside6==6.10.0
+pyside6_addons==6.10.0
+pyside6_essentials==6.10.0
