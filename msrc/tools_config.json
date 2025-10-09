@@ -55,6 +55,16 @@
         "placeholder": null,
         "required": false,
         "readonly": false
+      },
+      {
+        "name": "memo",
+        "type": "list",
+        "label": "Memo",
+        "default": "Page range can be \"all\" or \nRange of page number like 1,2,3 or \nSet of page like 2,3,5-7, 1,9,8",
+        "choices": null,
+        "placeholder": null,
+        "required": false,
+        "readonly": true
       }
     ],
     "notes": "Combine up to two PDFs with page ranges"
