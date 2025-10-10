@@ -1,4 +1,3 @@
-
 import json, os, sys, threading, subprocess, shlex, time, signal, html
 from dataclasses    import dataclass, field
 from typing         import Any, Dict, List, Optional
@@ -7,6 +6,16 @@ from PySide6.QtCore import Qt
 from pathlib        import Path
 os.environ["QT_LOGGING_RULES"] = "qt.qpa.window=false"
 from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel, QTextEdit
+
+def APP_DIR() -> Path:
+    # If bundled by PyInstaller, use the EXE folder; otherwise use project root (parent of msrc)
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).resolve().parents[1]
+
+CONFIG_FILE = str(APP_DIR() / "msrc" / "tools_config.json")
+APP_TITLE   = "PLAR : Python Local App Runner [-_-']"
+
 
 # ======== class QProcRunner ==============================================================
 # =========================================================================================
@@ -56,7 +65,6 @@ class InputSpec:
     label: Optional[str] = None
     default: Optional[Any] = None
     choices: Optional[List[str]] = None  # for enum
-    placeholder: Optional[str] = None
     required: bool = False
     readonly: bool = False
 
@@ -104,6 +112,13 @@ def load_config(path: str) -> List[ToolSpec]:
 
     tools: List[ToolSpec] = []
     for t in raw:
+        
+        inputs = []
+        for i in t.get("inputs", []):
+            i = dict(i)                      # copy
+            i.pop("placeholder", None)       # drop legacy key safely
+            inputs.append(InputSpec(**i))
+
         tools.append(
             ToolSpec(
                 name=t.get("name", "Untitled"),
@@ -111,7 +126,7 @@ def load_config(path: str) -> List[ToolSpec]:
                 runner=t.get("runner", ""),
                 script=t.get("script"),
                 output_dir_optional=t.get("output_dir_optional", False),
-                inputs=[InputSpec(**i) for i in t.get("inputs", [])],
+                inputs=inputs,
                 notes=t.get("notes")
             )
         )
@@ -126,7 +141,15 @@ def save_config(path: str, tools: List[ToolSpec]):
             "runner": t.runner,
             "script": t.script,
             "output_dir_optional": False,
-            "inputs": [i.__dict__ for i in t.inputs],
+            "inputs": [{"name": i.name,
+                        "type": i.type,
+                        "label": i.label,
+                        "default": i.default,
+                        "choices": i.choices,
+                        "required": i.required,
+                        "readonly": i.readonly,
+                    } for i in t.inputs],
+
             "notes": t.notes
         })
     with open(path, "w", encoding="utf-8") as f:
@@ -250,6 +273,13 @@ class ToolEditor(QtWidgets.QDialog):
         add_btn.clicked.connect(self._add_input_row)
         remove_btn.clicked.connect(self._remove_selected_input_rows)
         input_bar.addWidget(add_btn); input_bar.addWidget(remove_btn); input_bar.addStretch()
+        
+        # --- inside ToolEditor.__init__ (after input_bar is created) ---
+        gen_btn = QtWidgets.QPushButton("Generate Parameter Snippets")
+        gen_btn.setToolTip("Build argparse code, sample CLI, runner placeholders, and JSON inputs from the current table.")
+        gen_btn.clicked.connect(self._on_generate_snippets)
+        input_bar.addWidget(gen_btn)
+
 
         btn_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)
         btn_box.accepted.connect(self.accept)
@@ -265,6 +295,191 @@ class ToolEditor(QtWidgets.QDialog):
         # load existing inputs
         for i in self.tool.inputs:
             self._add_input_row(i)
+
+
+    # --- inside ToolEditor class ---
+    def _read_inputs_from_table(self) -> List[InputSpec]:
+        """Read current rows without committing the dialog."""
+        specs: List[InputSpec] = []
+        for r in range(self.inputs_table.rowCount()):
+            name_w = self.inputs_table.cellWidget(r, 0)
+            type_w = self.inputs_table.cellWidget(r, 1)
+            label_w = self.inputs_table.cellWidget(r, 2)
+            default_w = self.inputs_table.cellWidget(r, 3)
+            # choices_w = self.inputs_table.cellWidget(r, 4)
+            if not name_w or not type_w:
+                continue
+            name = name_w.text().strip()
+            if not name:
+                continue
+            itype = type_w.currentText()
+            label = (label_w.text().strip() or None) if label_w else None
+            default_txt = default_w.text() if default_w else ""
+            if default_txt == "":
+                default = None
+            elif itype == "int":
+                try: default = int(default_txt)
+                except: default = 0
+            elif itype == "float":
+                try: default = float(default_txt)
+                except: default = 0.0
+            else:
+                default = default_txt
+
+            # choices_txt = choices_w.text().strip() if choices_w else ""
+            # choices = [c.strip() for c in choices_txt.split(",")] if (choices_txt and itype in ("enum","multienum")) else None
+
+            required = self._get_checkbox_checked(r, 5)
+            readonly = self._get_checkbox_checked(r, 6)
+
+            specs.append(InputSpec(
+                name=name, type=itype, label=label, default=default,
+                # choices=choices, required=required, readonly=readonly
+                required=required, readonly=readonly
+            ))
+        return specs
+    
+    # --- inside ToolEditor class ---
+    def _build_snippets(self, specs: List[InputSpec]) -> dict[str, str]:
+        def py_type(itype: str) -> str | None:
+            return {"string":"str","file":"str","folder":"str","int":"int","float":"float","date":"str"}.get(itype)
+
+        # argparse
+        lines = []
+        lines.append("import argparse\np = argparse.ArgumentParser()")
+        for s in specs:
+            flag = f'--{s.name}'
+            if s.type == "toggle":
+                default = "True" if str(s.default).strip().lower() in ("yes","true","on","1") else "False"
+                lines.append(f'p.add_argument("{flag}", action=argparse.BooleanOptionalAction, default={default})')
+            elif s.type in ("enum","multienum"):
+                # multienum comes in as CSV string by default; keep as str for CLI and parse later
+                # choices = f", choices={s.choices}" if s.choices else ""
+                default = "" if s.default in (None,"") else f", default={repr(s.default)}"
+                # lines.append(f'p.add_argument("{flag}", type=str{choices}{default})')
+                lines.append(f'p.add_argument("{flag}", type=str{default})')
+            else:
+                ty = py_type(s.type)
+                ty_part = f", type={ty}" if ty else ""
+                default = "" if s.default in (None,"") else f", default={repr(s.default)}"
+                required = ", required=True" if s.required else ""
+                help_part = f', help="{(s.label or s.name).replace(chr(34), chr(39))}"'
+                lines.append(f'p.add_argument("{flag}"{ty_part}{required}{default}{help_part})')
+        lines.append("\nargs,_ = p.parse_known_args()\n")
+        argparse_block = "\n".join(lines)
+
+        # sample CLI line
+        cli_bits = []
+        for s in specs:
+            f = f"--{s.name}"
+            if s.type == "toggle":
+                on = str(s.default).strip().lower() in ("yes","true","on","1")
+                cli_bits.append(f if on else f"--no-{s.name}")
+            else:
+                val = s.default
+                if val in (None, ""):
+                    # show placeholder by type
+                    placeholder = {
+                        "file":"<path/to/file>",
+                        "folder":"<path/to/folder>",
+                        "int":"<int>",
+                        "float":"<float>",
+                        "date":"<YYYY-MM-DD>",
+                        "multienum":"<a,b,c>",
+                    }.get(s.type, "<value>")
+                    cli_bits.append(f'{f} {placeholder}')
+                else:
+                    cli_bits.append(f'{f} "{val}"' if isinstance(val, str) else f'{f} {val}')
+        sample_cli = "python -u your_script.py " + " ".join(cli_bits)
+        
+            # runner template: {python_u} "{script}" + args
+        parts = ['{python_u} "{script}"']
+        def needs_quotes(s):  # string-ish types get quotes
+            return s in ("string","file","folder","date","enum","multienum")
+        for s in specs:
+            if s.type == "toggle":
+                parts.append(f"{{{s.name}_flag}}")
+            else:
+                if needs_quotes(s.type):
+                    parts.append(f'--{s.name} "{{{s.name}}}"')
+                else:
+                    parts.append(f'--{s.name} {{{s.name}}}')
+        runner_template = " ".join(parts)
+
+
+        # runner placeholders (matches ToolForm._build_command extras)
+        ph_lines = ["# Placeholders available in command templates:"]
+        for s in specs:
+            ph_lines.append(f"{{{s.name}}}")
+            if s.type == "toggle":
+                ph_lines.append(f"{{{s.name}_flag}}   # --{s.name} or --no-{s.name}")
+                ph_lines.append(f"{{{s.name}_yn}}     # yes/no")
+                ph_lines.append(f"{{{s.name}_01}}     # 1/0")
+        ph_block = "\n".join(ph_lines)
+
+        # JSON inputs array (handy for config authoring)
+        import json as _json
+        def jdefault(x): return x
+        inputs_json = _json.dumps([{
+            "name": s.name,
+            "type": s.type,
+            "label": s.label or s.name,
+            "default": s.default,
+            # "choices": s.choices,
+            # "placeholder": getattr(s, "placeholder", None),
+            "required": s.required,
+            "readonly": s.readonly
+        } for s in specs], indent=2, ensure_ascii=False, default=jdefault)
+
+        return {
+            "Argparse (Python)": argparse_block.strip(),
+            "Sample CLI": sample_cli.strip(),
+            "Runner template": runner_template.strip(), 
+            "Template placeholders": ph_block.strip(),
+            "JSON inputs": inputs_json.strip(),
+        }
+
+
+    # --- inside ToolEditor class ---
+    def _on_generate_snippets(self):
+        specs = self._read_inputs_from_table()
+        if not specs:
+            QtWidgets.QMessageBox.information(self, "No parameters", "Please add at least one input first.")
+            return
+        data = self._build_snippets(specs)
+        self._show_snippet_dialog(data)
+
+    def _show_snippet_dialog(self, data: dict[str, str]):
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Generated Snippets")
+        dlg.resize(900, 600)
+        tabs = QtWidgets.QTabWidget()
+        for title, text in data.items():
+            w = QtWidgets.QWidget()
+            v = QtWidgets.QVBoxLayout(w)
+            edit = QtWidgets.QPlainTextEdit()
+            edit.setReadOnly(True)
+            edit.setPlainText(text)
+            btns = QtWidgets.QHBoxLayout()
+            
+            copy_btn = QtWidgets.QPushButton("Copy")
+
+            def _copy(checked=False, e=edit):
+                QtGui.QGuiApplication.clipboard().setText(e.toPlainText())
+                QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), "Copied!")
+
+            copy_btn.clicked.connect(_copy)
+                        
+            
+            btns.addStretch(); btns.addWidget(copy_btn)
+            v.addWidget(edit); v.addLayout(btns)
+            tabs.addTab(w, title)
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        bb.rejected.connect(dlg.reject); bb.accepted.connect(dlg.accept)
+        lay = QtWidgets.QVBoxLayout(dlg)
+        lay.addWidget(tabs); lay.addWidget(bb)
+        dlg.exec()
+
 
     def _pick_python(self):
         fn, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select python.exe", "", "Executables (*.exe);;All files (*.*)")
@@ -493,7 +708,7 @@ class ToolForm(QtWidgets.QWidget):
             QGroupBox {
                 border: 2px solid #33BEE8F7;        /*#33BEE8F7*/
                 border-radius: 10px;
-                background:#80BEE8F7;               /* #80BEE8F7 */  
+                background:#80BEE8F7;               /* #80BEE8F7  */  
                 margin-top: 24px;                /* push border down */
                 padding-top: 12px;
             }
@@ -620,9 +835,7 @@ class ToolForm(QtWidgets.QWidget):
             if spec.choices:
                 choices = ", ".join(esc(str(c)) for c in spec.choices)
                 bits.append(f"<div style='margin-left:.1em'><i>Choices:</i> {choices}</div>")
-            if getattr(spec, "placeholder", None):
-                bits.append(f"<div style='margin-left:.1em'><i>Hint:</i> {esc(spec.placeholder)}</div>")
-
+            
             items.append("<li>" + "".join(bits) + "</li>")            
 
         params_html = "<ul style='margin:0 0 0 .1em; padding:0'>" + "".join(items) + "</ul>" if items else "—"
@@ -1753,18 +1966,14 @@ def _qt_msg_filter(mode, ctx, msg):
 
 QtCore.qInstallMessageHandler(_qt_msg_filter)
 
-def APP_DIR() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parents[1]
-
-CONFIG_FILE = str(APP_DIR() / "msrc" / "tools_config.json")
-APP_TITLE   = "PLAR : Python Local App Runner [-_-']"
-
 def main():
     os.chdir(APP_DIR())
     app = QtWidgets.QApplication(sys.argv)
-    apply_modern_theme(app, mode='light') #Theme settings failed >_<, use only light for now.
+    # apply_modern_theme(app, mode="auto")  # Light/Dark toggle also available in toolbar
+    # settings = QtCore.QSettings("PlarApp", "LocalAppRunner")
+    # start_mode = settings.value("theme", "auto")
+    # apply_modern_theme(app, mode=start_mode)
+    apply_modern_theme(app, mode='light')
 
     tools = load_config(CONFIG_FILE)
     
@@ -1773,6 +1982,7 @@ def main():
         msg = "".join(traceback.format_exception(exctype, value, tb))
         QtWidgets.QMessageBox.critical(None, "Unhandled Error", msg)
 
+    # ...
     w = MainWindow(tools)
     w.show()
     sys.excepthook = _show_crash_box   # <-- add this line
@@ -1782,4 +1992,4 @@ def main():
 if __name__ == "__main__":
     main()
 
-# ---- the end, my first public repo ----
+# 
