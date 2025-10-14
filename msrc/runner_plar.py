@@ -342,7 +342,7 @@ class ToolEditor(QtWidgets.QDialog):
     # --- inside ToolEditor class ---
     def _build_snippets(self, specs: List[InputSpec]) -> dict[str, str]:
         def py_type(itype: str) -> str | None:
-            return {"string":"str","file":"str","folder":"str","int":"int","float":"float","date":"str"}.get(itype)
+            return {"string":"str","file":"str","folder":"str","int":"int","float":"float","date":"str", "password":"str" }.get(itype)
 
         # argparse
         lines = []
@@ -395,7 +395,7 @@ class ToolEditor(QtWidgets.QDialog):
             # runner template: {python_u} "{script}" + args
         parts = ['{python_u} "{script}"']
         def needs_quotes(s):  # string-ish types get quotes
-            return s in ("string","file","folder","date","enum","multienum")
+            return s in ("string","file","folder","date","enum","multienum", "password")
         for s in specs:
             if s.type == "toggle":
                 parts.append(f"{{{s.name}_flag}}")
@@ -502,7 +502,7 @@ class ToolEditor(QtWidgets.QDialog):
 
 		# Type
         type_cb = QtWidgets.QComboBox()
-        type_cb.addItems(["string","int","float","file","folder","enum","multienum","toggle","date","list"])
+        type_cb.addItems(["string","int","float","file","folder","enum","multienum","toggle","date","list", "password"])
 
         type_cb.setCurrentText(spec.type if spec else "string")
         self.inputs_table.setCellWidget(r, 1, type_cb)
@@ -831,7 +831,9 @@ class ToolForm(QtWidgets.QWidget):
 
             bits = [f"<b>{iCountParameter} : {label}</b> <span style='color:#888;'>[{typ}, {req}]</span>"]
             if spec.default not in (None, ""):
-                bits.append(f"<div style='margin-left:.1em'><i>Default:</i> {esc(str(spec.default))}</div>")
+                shown_default = "••••" if (spec.type or "").lower() == "password" else str(spec.default)
+                bits.append(f"<div style='margin-left:.1em'><i>Default:</i> {esc(shown_default)}</div>")
+                # bits.append(f"<div style='margin-left:.1em'><i>Default:</i> {esc(str(spec.default))}</div>")
             if spec.choices:
                 choices = ", ".join(esc(str(c)) for c in spec.choices)
                 bits.append(f"<div style='margin-left:.1em'><i>Choices:</i> {choices}</div>")
@@ -936,6 +938,25 @@ class ToolForm(QtWidgets.QWidget):
                         elif isinstance(spec.default, (list, tuple)):
                             defaults = list(spec.default)
                     w.setCheckedItems(defaults)
+                elif spec.type == "password":
+                    le = QtWidgets.QLineEdit()
+                    le.setEchoMode(QtWidgets.QLineEdit.Password)
+
+                    # set default if provided (use with care)
+                    if spec.default is not None:
+                        le.setText(str(spec.default))
+
+                    # add an inline eye icon to toggle visibility
+                    act = QtGui.QAction(self)
+                    act.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_DialogYesButton))  # simple icon; swap if you have an eye icon
+                    act.setCheckable(True)
+                    def _toggle_pwd():
+                        le.setEchoMode(QtWidgets.QLineEdit.Normal if act.isChecked() else QtWidgets.QLineEdit.Password)
+                    act.toggled.connect(_toggle_pwd)
+
+                    le.addAction(act, QtWidgets.QLineEdit.TrailingPosition)
+                    w = le
+
                 elif spec.type == "list":
                     w = QtWidgets.QPlainTextEdit()
                     w.setPlaceholderText("-")
@@ -985,7 +1006,7 @@ class ToolForm(QtWidgets.QWidget):
         for spec in self.tool.inputs:
             w = self.fields.get(spec.name)
             if not w: continue
-            if spec.type in ("string","file","folder"):
+            if spec.type in ("string","file","folder","password"):
                 if hasattr(w, "_file_line"):
                     vals[spec.name] = w._file_line.text().strip()
                 else:
