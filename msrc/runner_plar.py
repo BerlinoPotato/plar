@@ -679,6 +679,17 @@ class ToolForm(QtWidgets.QWidget):
         self.run_btn.setMinimumWidth(140)   # 140–180 works nicely
         self.stop_btn.setMinimumWidth(140)
         
+        # --- Export / Import buttons ---
+        self.import_btn = QtWidgets.QPushButton("Import")
+        self.export_btn = QtWidgets.QPushButton("Export")        
+
+        self.export_btn.setMinimumWidth(80)
+        self.import_btn.setMinimumWidth(80)
+
+        self.export_btn.clicked.connect(self._export_params)
+        self.import_btn.clicked.connect(self._import_params)
+
+        
         self.run_btn.setStyleSheet("""
         QPushButton#Primary{
             background:#ADE4F7;   /* blue */
@@ -736,6 +747,8 @@ class ToolForm(QtWidgets.QWidget):
         btn_row = QtWidgets.QHBoxLayout()
         btn_row.addWidget(self.run_btn)
         btn_row.addWidget(self.stop_btn)
+        btn_row.addWidget(self.import_btn)   # NEW
+        btn_row.addWidget(self.export_btn)   # NEW        
         btn_row.addStretch()
         self.run_btn.clicked.connect(self._on_run)
         self.stop_btn.clicked.connect(self._on_stop)
@@ -1140,6 +1153,140 @@ class ToolForm(QtWidgets.QWidget):
             return shlex.split(templ)
         else:
             raise ValueError("Unknown runner_mode: " + tool.runner_mode)
+
+    def _params_dict(self) -> dict:
+        """Build a portable payload of the current tool's parameters."""
+        vals = self.collect_values()                 # you already have this
+        # strip special/internal keys
+        vals = {k: v for k, v in vals.items() if not k.startswith("_")}
+        meta = {
+            "tool": (self.tool.name if self.tool else None),
+            "runner_mode": (self.tool.runner_mode if self.tool else None),
+            "runner": (self.tool.runner if self.tool else None),
+            "script": (self.tool.script if self.tool else None),
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "app": "PLAR",
+            "version": 1,
+        }
+        return {"meta": meta, "values": vals}
+
+    def _apply_params(self, values: dict):
+        """Apply a dict of name->value to the current form fields by type."""
+        if not self.tool:
+            return
+        for spec in self.tool.inputs:
+            name = spec.name
+            if name not in values:
+                continue
+            v = values[name]
+            w = self.fields.get(name)
+            if not w:
+                continue
+
+            t = spec.type or "string"
+            try:
+                if t in ("string", "file", "folder", "password"):
+                    if hasattr(w, "_file_line"):
+                        w._file_line.setText(str(v or ""))
+                    elif isinstance(w, QtWidgets.QLineEdit):
+                        w.setText(str(v or ""))
+                elif t == "int" and isinstance(w, QtWidgets.QSpinBox):
+                    w.setValue(int(v))
+                elif t == "float" and isinstance(w, QtWidgets.QDoubleSpinBox):
+                    w.setValue(float(v))
+                elif t == "enum" and isinstance(w, QtWidgets.QComboBox):
+                    idx = w.findText(str(v))
+                    if idx >= 0:
+                        w.setCurrentIndex(idx)
+                elif t == "multienum" and hasattr(w, "setCheckedItems"):
+                    if isinstance(v, str):
+                        items = [s.strip() for s in v.split(",") if s.strip()]
+                    elif isinstance(v, (list, tuple)):
+                        items = list(v)
+                    else:
+                        items = []
+                    w.setCheckedItems(items)
+                elif t == "date" and isinstance(w, QtWidgets.QDateEdit):
+                    qd = QtCore.QDate.fromString(str(v), "yyyy-MM-dd")
+                    if qd.isValid():
+                        w.setDate(qd)
+                elif t == "toggle" and isinstance(w, QtWidgets.QCheckBox):
+                    # accept bool, "yes/no", "true/false", "1/0"
+                    sv = str(v).strip().lower()
+                    on = v is True or sv in ("1", "true", "yes", "on")
+                    w.setChecked(on)
+                elif t == "list" and isinstance(w, QtWidgets.QPlainTextEdit):
+                    # accept CSV or list; store each on its own line
+                    if isinstance(v, str):
+                        items = [s.strip() for s in v.split(",") if s.strip()]
+                    elif isinstance(v, (list, tuple)):
+                        items = list(v)
+                    else:
+                        items = []
+                    w.setPlainText("\n".join(items))
+                else:
+                    # default / fallback
+                    if isinstance(w, QtWidgets.QLineEdit):
+                        w.setText(str(v or ""))
+            except Exception as e:
+                # Non-fatal: continue applying what we can
+                self.log.appendPlainText(f"[apply] {name}: {e}")
+
+    def _export_params(self):
+        """Export current parameters to a JSON file."""
+        if not self.tool:
+            QtWidgets.QMessageBox.information(self, "Export", "No tool selected.")
+            return
+        safe_tool = "".join(c for c in (self.tool.name or "tool") if c.isalnum() or c in (" ","-","_")).strip()
+        suggested = f"{safe_tool} - {time.strftime('%Y%m%d-%H%M%S')}.plar.json"
+        fn, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export Parameters", suggested, "PLAR Settings (*.plar.json);;JSON (*.json);;All files (*.*)"
+        )
+        if not fn:
+            return
+        try:
+            payload = self._params_dict()
+            with open(fn, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+            self.status.setText(f"Exported parameters → {Path(fn).name}")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Export Failed", str(e))
+
+    def _import_params(self):
+        """Import parameters from a JSON file and apply to current form."""
+        if not self.tool:
+            QtWidgets.QMessageBox.information(self, "Import", "No tool selected.")
+            return
+        fn, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Import Parameters", "", "PLAR Settings (*.plar.json *.json);;All files (*.*)"
+        )
+        if not fn:
+            return
+        try:
+            with open(fn, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # accept either {"meta":..., "values":...} or plain dict of values
+            meta = data.get("meta", {}) if isinstance(data, dict) else {}
+            values = data.get("values", data if isinstance(data, dict) else {})
+
+            # Friendly guard: tool mismatch
+            meta_tool = (meta.get("tool") or "").strip()
+            cur_tool = (self.tool.name or "").strip()
+            if meta_tool and meta_tool != cur_tool:
+                ans = QtWidgets.QMessageBox.question(
+                    self,
+                    "Apply anyway?",
+                    f"Settings were saved for tool:\n  '{meta_tool}'\n\nCurrent tool is:\n  '{cur_tool}'\n\nApply anyway?"
+                )
+                if ans != QtWidgets.QMessageBox.Yes:
+                    return
+
+            self._apply_params(values)
+            self.status.setText(f"Imported parameters ← {Path(fn).name}")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Import Failed", str(e))
+
+
 
 #-------------- combo box with icons --------------
 # ======== class CheckableComboBox ========================================================
