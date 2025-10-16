@@ -7,6 +7,9 @@ from pathlib        import Path
 os.environ["QT_LOGGING_RULES"] = "qt.qpa.window=false"
 from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel, QTextEdit
 
+import warnings
+warnings.simplefilter("ignore", UserWarning)
+
 def APP_DIR() -> Path:
     # If bundled by PyInstaller, use the EXE folder; otherwise use project root (parent of msrc)
     if getattr(sys, "frozen", False):
@@ -1370,6 +1373,10 @@ class MainWindow(QtWidgets.QMainWindow):
         lay.addWidget(splitter)
         self.setCentralWidget(central)
         
+        # Global (in-window) shortcut: Ctrl+R, Ctrl+Enter, Ctrl+Return to run the selected tool
+        for seq in ("Ctrl+R", "Ctrl+Return", "Ctrl+Enter", "F2"):
+            sc = QtGui.QShortcut(QtGui.QKeySequence(seq), self)
+            sc.activated.connect(self._shortcut_run)
         
         # smoother divider drag (less repaint work)
         splitter.setOpaqueResize(False)
@@ -1463,6 +1470,24 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Show the menu
         menu.exec(global_pos)
+    
+    def _focus_main_and_select(self):
+        # Show the main window if minimized / hidden
+        if self.isMinimized():
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+        # Ensure a tool is selected
+        if self._current_tool_index() < 0 and self.list.count() > 0:
+            row = self._last_applied_row if self._last_applied_row >= 0 else 0
+            self.list.setCurrentRow(max(0, min(row, self.list.count() - 1)))
+            QtCore.QCoreApplication.processEvents(QtCore.QEventLoop.AllEvents, 50)
+
+    def _shortcut_run(self):
+        self._focus_main_and_select()
+        self._run_selected()
+
     
     def _reload_list(self):
         self.list.clear()
