@@ -80,10 +80,8 @@ class InputSpec:
 @dataclass
 class ToolSpec:
     name: str
-    runner_mode: str = "module"           # module | command
     runner: str = ""                      # "pkg.mod:function" OR command template
     script: Optional[str] = None          # optional helper for command template
-    output_dir_optional: bool = False
     inputs: List[InputSpec] = field(default_factory=list)
     notes: Optional[str] = None
 
@@ -99,10 +97,8 @@ def load_config(path: str) -> List[ToolSpec]:
         default_config = [
             {
                 "name": "Sample Tool (Demo)",
-                "runner_mode": "command",
                 "runner": "{python} -c \"print('Hello from sample tool!')\"",
                 "script": None,
-                "output_dir_optional": False,
                 "inputs": [],
                 "notes": "This is a placeholder tool automatically created because config file was missing."
             }
@@ -118,7 +114,9 @@ def load_config(path: str) -> List[ToolSpec]:
 
     tools: List[ToolSpec] = []
     for t in raw:
-        
+        if t.get("runner_mode"): 
+            print('something still call Runner mode 9741')
+            pass
         inputs = []
         for i in t.get("inputs", []):
             i = dict(i)                      # copy
@@ -128,10 +126,8 @@ def load_config(path: str) -> List[ToolSpec]:
         tools.append(
             ToolSpec(
                 name=t.get("name", "Untitled"),
-                runner_mode=t.get("runner_mode", "module"),
                 runner=t.get("runner", ""),
                 script=t.get("script"),
-                output_dir_optional=t.get("output_dir_optional", False),
                 inputs=inputs,
                 notes=t.get("notes")
             )
@@ -143,10 +139,8 @@ def save_config(path: str, tools: List[ToolSpec]):
     for t in tools:
         data.append({
             "name": t.name,
-            "runner_mode": t.runner_mode,
             "runner": t.runner,
             "script": t.script,
-            "output_dir_optional": False,
             "inputs": [{"name": i.name,
                         "type": i.type,
                         "label": i.label,
@@ -160,13 +154,6 @@ def save_config(path: str, tools: List[ToolSpec]):
         })
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
-
-def parse_module_runner(s: str):
-    # "pkg.mod:function" -> ("pkg.mod", "function")
-    if ":" not in s:
-        raise ValueError("Runner must be 'pkg.module:function'")
-    mod, func = s.split(":", 1)
-    return mod.strip(), func.strip()
 
 # ---------- Runner Thread ----------
 # ======== class ProcRunner ===============================================================
@@ -251,21 +238,16 @@ class ToolEditor(QtWidgets.QDialog):
         self.inputs_table.verticalHeader().setVisible(False)
 
         # Top fields
-        self.name_edit = QtWidgets.QLineEdit(self.tool.name)
-        self.mode_cb   = QtWidgets.QComboBox(); self.mode_cb.addItems(["module","command"])
-        self.mode_cb.setCurrentText(self.tool.runner_mode)
+        self.name_edit = QtWidgets.QLineEdit(self.tool.name)        
         self.runner_edit = QtWidgets.QLineEdit(self.tool.runner)
         self.script_edit = QtWidgets.QLineEdit(self.tool.script or "")
         self.script_btn  = QtWidgets.QPushButton("...")
         self.script_btn.clicked.connect(self._pick_script)
-        # self.output_opt  = QtWidgets.QCheckBox("Output folder optional"); self.output_opt.setChecked(self.tool.output_dir_optional)
         self.notes_edit  = QtWidgets.QPlainTextEdit(self.tool.notes or "")
 
         # Layout
         form = QtWidgets.QFormLayout()
         form.addRow("Name:", self.name_edit)
-        
-        form.addRow("Runner mode:", self.mode_cb)
         form.addRow("Runner:", self.runner_edit)
         scr_row = QtWidgets.QHBoxLayout(); scr_row.addWidget(self.script_edit); scr_row.addWidget(self.script_btn)
         form.addRow("Script:", scr_row)
@@ -616,10 +598,8 @@ class ToolEditor(QtWidgets.QDialog):
             ))
         t = ToolSpec(
             name=self.name_edit.text().strip() or "Untitled",
-            runner_mode=self.mode_cb.currentText(),
             runner=self.runner_edit.text().strip(),
             script=self.script_edit.text().strip() or None,
-            # output_dir_optional=False,
             inputs=inputs,
             notes=self.notes_edit.toPlainText().strip() or None
         )
@@ -1243,8 +1223,6 @@ class ToolForm(QtWidgets.QWidget):
 
     def _build_command(self, tool: ToolSpec, vals: Dict[str, Any]) -> List[str]:
         
-        
-        
         py = sys.executable.replace(chr(92), chr(47))
         
         if not os.path.isfile(py):
@@ -1266,22 +1244,7 @@ class ToolForm(QtWidgets.QWidget):
             placeholders[f"{k}_yn"]   = "yes" if on else "no"
             placeholders[f"{k}_01"]   = "1" if on else "0"
         
-        if tool.runner_mode == "module":
-            # python -m pkg.module --func function_name --k v ...
-            mod, func = parse_module_runner(tool.runner)
-            # cmd = [py, "-m", mod, "--func", func]
-            cmd = [py, "-u", "-m", mod, "--func", func]
-
-            # add inputs as --key value
-            for k, v in vals.items():
-                if k == "_output_dir": continue
-                cmd += [f"--{k}", str(v)]
-            if vals.get("_output_dir"):
-                cmd += ["--output_dir", vals["_output_dir"]]
-            return cmd
-
-        elif tool.runner_mode == "command":
-            # command template, e.g.: "{python} {script} --in {images} --mode {mode} --out {output_dir}"
+        # command template, e.g.: "{python} {script} --in {images} --mode {mode} --out {output_dir}"
             if not tool.runner:
                 raise ValueError("Command template is empty.")
             # string substitute
@@ -1291,8 +1254,6 @@ class ToolForm(QtWidgets.QWidget):
                 raise ValueError(f"Missing placeholder in template: {e}")
             # shlex split to list
             return shlex.split(templ)
-        else:
-            raise ValueError("Unknown runner_mode: " + tool.runner_mode)
 
     def _params_dict(self) -> dict:
         """Build a portable payload of the current tool's parameters."""
@@ -1301,7 +1262,6 @@ class ToolForm(QtWidgets.QWidget):
         vals = {k: v for k, v in vals.items() if not k.startswith("_")}
         meta = {
             "tool": (self.tool.name if self.tool else None),
-            "runner_mode": (self.tool.runner_mode if self.tool else None),
             "runner": (self.tool.runner if self.tool else None),
             "script": (self.tool.script if self.tool else None),
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1869,11 +1829,8 @@ class MainWindow(QtWidgets.QMainWindow):
         base = self.tools[idx]
         clone = ToolSpec(
             name=base.name + " (copy)",
-            runner_mode=base.runner_mode,
             runner=base.runner,
             script=base.script,
-            # output_dir_optional=base.output_dir_optional,
-            output_dir_optional=False,
             inputs=[InputSpec(**i.__dict__) for i in base.inputs],
             notes=base.notes
         )
