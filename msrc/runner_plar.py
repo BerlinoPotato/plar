@@ -1773,11 +1773,32 @@ class MainWindow(QtWidgets.QMainWindow):
 
     
     def _reload_list(self):
+    # keep current selection if you want
+        current_name = None
+        if (it := self.list.currentItem()):
+            current_name = it.data(QtCore.Qt.UserRole) or it.text()
+
+        self.list.blockSignals(True)
         self.list.clear()
-        for t in self.tools:
-            item = QtWidgets.QListWidgetItem(t.name)
-            item.setData(QtCore.Qt.UserRole, t)
-            self.list.addItem(item)
+
+        digits = max(2, len(str(len(self.tools))))  # or just use 2
+
+        for i, t in enumerate(self.tools):
+            label = f"{i+1:0{digits}d} : {t.name}"
+
+            it = QtWidgets.QListWidgetItem(label)  # <-- NEW item each iteration
+            it.setData(QtCore.Qt.UserRole, t.name)
+            self.list.addItem(it)
+
+        # restore selection by name (optional)
+        if current_name:
+            for row in range(self.list.count()):
+                if self.list.item(row).data(QtCore.Qt.UserRole) == current_name:
+                    self.list.setCurrentRow(row)
+                    break
+
+        self.list.blockSignals(False)
+
 
     def _on_select(self):
         self._select_timer.start(150)
