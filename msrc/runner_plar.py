@@ -522,12 +522,7 @@ class ToolEditor(QtWidgets.QDialog):
         choices = QtWidgets.QLineEdit("" if not spec or not spec.choices else ",".join(spec.choices))
         self.inputs_table.setCellWidget(r, 4, choices)
 
-		# Required (centered via layout)
-        # req = QtWidgets.QCheckBox()
-        # req.setChecked(spec.required if spec else False)
-        
-        
-        # Required (centered)
+		# Required (centered)
         req = QtWidgets.QCheckBox()
         req.setChecked(spec.required if spec else False)
         cell_req = QtWidgets.QWidget()
@@ -635,188 +630,325 @@ class ToolForm(QtWidgets.QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # ---- 0) Core state & essentials -------------------------------------
+        self._init_state()
+
+        # ---- 1) Build UI pieces (modular) -----------------------------------
+        title_row  = self._create_title_row() # “No tool selected” + info button
+        form_box   = self._create_form_box()  # Scrollable “Application Inputs” box
+        logs_panel = self._create_log_view()  # Log label + QPlainTextEdit configured
+        self._create_run_controls()        # Run / Stop / Import / Export buttons (+ styles)
+
+        # ---- 2) Combine big panels with a resizable splitter ----------------
+        splitter = self._create_io_splitter(form_box, logs_panel)
+        self._finalize_layout(title_row, splitter)
+        self._wire_actions()
+        self.runner: Optional[QProcRunner] = None
+
+    # ========================================================================
+    # =============== Helper builders (private methods) =======================
+    # ========================================================================
+
+    # 0) Core state & essentials
+    def _init_state(self):
+        """Initialize model/fields and top-level layout container."""
         self._busy = False
         self.tool: Optional[ToolSpec] = None
         self.fields: Dict[str, QtWidgets.QWidget] = {}
+
+        # frequently referenced widgets
         self.output_dir = QtWidgets.QLineEdit()
-        self.log = QtWidgets.QPlainTextEdit()
-        self.log.setObjectName("LogView") 
+        self.log        = QtWidgets.QPlainTextEdit()
+        self.status     = QtWidgets.QLabel("Ready")
+        self.cwd        = os.getcwd()
+
+        # Root layout of this widget
+        self._root_v = QtWidgets.QVBoxLayout(self)
+        self._root_v.setContentsMargins(0, 0, 0, 0)
+
+    # 1.a) Buttons row: Run / Stop / Import / Export
+    def _create_run_controls(self):
+        """Create the bottom button row and style primary/danger buttons."""
+        # Keep two logical objects for Run/Stop (reused elsewhere)
+        self.run_btn  = QtWidgets.QPushButton("Run")
+        self.stop_btn = QtWidgets.QPushButton("Stop")
+        self.stop_btn.setEnabled(False)
+
+        self.run_btn.setObjectName("Primary")
+        self.stop_btn.setObjectName("Danger")
+        self.run_btn.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay))
+        self.stop_btn.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_BrowserStop))
+        self.run_btn.setMinimumWidth(140)
+        self.stop_btn.setMinimumWidth(140)
+
+        # Import/Export
+        self.import_btn = QtWidgets.QPushButton("Import")
+        self.export_btn = QtWidgets.QPushButton("Export")
+        self.import_btn.setMinimumWidth(80)
+        self.export_btn.setMinimumWidth(80)
+
+        # Styles exactly as before btn_run btn run 
+        self.run_btn.setStyleSheet("""
+        QPushButton#Primary{
+            background:#ADE4F7;
+            color:black;
+            border:1px solid #38B5E0;
+            border-radius:10px;
+            padding:9px 15px;
+            font-weight:600;
+        }               
+        
+        QPushButton#Primary:hover{ background:#38B5E0;}
+        QPushButton#Primary:pressed{ background:#104A91; border:none; border-radius:10px;}
+        QPushButton#Primary:disabled{ background:#D7DEDE; color:rgba(255,255,255,0.85); border:none; border-radius:10px;}
+        """)
+        
+        self.stop_btn.setStyleSheet("""
+        QPushButton#Danger{
+            background:#ED7272; color:black;
+            border:none; border-radius:10px;
+            padding:10px 16px; font-weight:600;
+        }
+        QPushButton#Danger:hover{ background:#80ED7272; }
+        QPushButton#Danger:pressed{ background:#b91c1c; }
+        QPushButton#Danger:disabled{ background:#D7DEDE; color:rgba(255,255,255,0.9); }
+        """)
+
+        # Build the row layout and keep a handle for later
+        self._btn_row = QtWidgets.QHBoxLayout()
+        self._btn_row.addWidget(self.run_btn)
+        self._btn_row.addWidget(self.stop_btn)
+        self._btn_row.addWidget(self.import_btn)
+        self._btn_row.addWidget(self.export_btn)
+        self._btn_row.addStretch()
+
+    # 1.b) Logs view (label + QPlainTextEdit)
+    def _create_log_view(self) -> QtWidgets.QWidget:
+        """Configure the log text box and wrap it with its label into a panel."""
+        # Configure QPlainTextEdit (unchanged logic)
+        self.log.setObjectName("LogView")
         self.log.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
-        self.log.setMinimumHeight(220)   # optional
+        self.log.setMinimumHeight(80)
         try:
             mono = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
         except Exception:
-            # Fallbacks (Windows first)
             for fam in ["Consolas", "Cascadia Mono", "Courier New", "DejaVu Sans Mono", "Menlo", "Monaco"]:
                 if QtGui.QFont(fam).exactMatch():
                     mono = QtGui.QFont(fam)
                     break
             else:
-                mono = self.font()  # last resort
-
-        mono.setPointSize(12)  # tweak to taste
+                mono = self.font()
+        mono.setPointSize(12)
         self.log.setFont(mono)
         self.log.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
         metrics = QtGui.QFontMetricsF(mono)
-        self.log.setTabStopDistance(4 * metrics.horizontalAdvance(" "))        
+        self.log.setTabStopDistance(4 * metrics.horizontalAdvance(" "))
         self.log.setReadOnly(True)
-        self.run_btn = QtWidgets.QPushButton("▶ Run")
-        self.stop_btn = QtWidgets.QPushButton("■ Stop")
-        self.stop_btn.setEnabled(False)
-        self.status = QtWidgets.QLabel("Ready")
-        self.cwd = os.getcwd()
-
         
-        # In ToolForm.__init__
-        self.run_btn = QtWidgets.QPushButton("Run")
-        self.run_btn.setObjectName("Primary")
-        self.run_btn.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay))
+        # Make Application Logs white with dark text
+        pal = self.log.palette()
+        pal.setColor(QtGui.QPalette.Base, QtGui.QColor("#FFFFFF"))   # edit area background
+        pal.setColor(QtGui.QPalette.Text, QtGui.QColor("#010282"))   # text color
+        self.log.setPalette(pal)
 
-        self.stop_btn = QtWidgets.QPushButton("Stop")
-        self.stop_btn.setObjectName("Danger")
-        self.stop_btn.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_BrowserStop))
+        # (optional) ensure it paints its own background
+        self.log.setAutoFillBackground(True)
 
-        self.run_btn.setMinimumWidth(140)   # 140–180 works nicely
-        self.stop_btn.setMinimumWidth(140)
-        
-        # --- Export / Import buttons ---
-        self.import_btn = QtWidgets.QPushButton("Import")
-        self.export_btn = QtWidgets.QPushButton("Export")        
 
-        self.export_btn.setMinimumWidth(80)
-        self.import_btn.setMinimumWidth(80)
+        # Bundle label + log into a panel
+        panel = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(panel)
+        v.setContentsMargins(0, 0, 0, 0)
 
-        self.export_btn.clicked.connect(self._export_params)
-        self.import_btn.clicked.connect(self._import_params)
+        label = QtWidgets.QLabel("  Application Logs:")
+        label.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
 
-        
-        self.run_btn.setStyleSheet("""
-        QPushButton#Primary{
-            background:#ADE4F7;   /* blue */
-            color:black;
-            border:none; border-radius:10px;
-            padding:10px 16px; font-weight:600;
-        }
-        QPushButton#Primary:hover{ background: #80ADE4F7; }  /* #80ADE4F7 */
-        QPushButton#Primary:pressed{ background:#104A91; }
-        QPushButton#Primary:disabled{ background:#D7DEDE; color:rgba(255,255,255,85%); }
-        """)
+        v.addWidget(label)
+        v.addWidget(self.log)
+        return panel
 
-        self.stop_btn.setStyleSheet("""
-        QPushButton#Danger{
-            background:#ED7272;   /* red */
-            color:black;
-            border:none; border-radius:10px;
-            padding:10px 16px; font-weight:600;
-        }
-        QPushButton#Danger:hover{ background:#80ED7272; }  /*#80ED7272*/
-        QPushButton#Danger:pressed{ background:#b91c1c; }
-        QPushButton#Danger:disabled{ background:#D7DEDE; color:rgba(255,255,255,0.9); }
-        """)
-        
-        # Layout
+    # 1.c) Scrollable “Application Inputs” box (GroupBox + QScrollArea)
+    def _create_form_box(self) -> QtWidgets.QGroupBox:
+        """Create the scrollable inputs container and its FormLayout."""
+        # Form layout that other code will keep populating
         self.form_layout = QtWidgets.QFormLayout()
-        form_box = QtWidgets.QGroupBox("Application Inputs:")
-        form_box.setLayout(self.form_layout)
-        form_box.setStyleSheet("""
-            QGroupBox {
-                border: 2px solid #33BEE8F7;        /*#33BEE8F7*/
-                border-radius: 10px;
-                background:#80BEE8F7;               /* #80BEE8F7  */  
-                margin-top: 24px;                /* push border down */
-                padding-top: 12px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                subcontrol-position: top left;
-                left: 0px;
-                top: -5px;                      /* move text above border */
-                padding: 0 6px;
-                font-size: 20px;
-                font-weight: 1200;
-                background: transparent;
-            }
-        """)
-
-        
         self.form_layout.setLabelAlignment(QtCore.Qt.AlignLeft)
         self.form_layout.setFormAlignment(QtCore.Qt.AlignTop)
         self.form_layout.setHorizontalSpacing(14)
         self.form_layout.setVerticalSpacing(10)
-        
-        btn_row = QtWidgets.QHBoxLayout()
-        btn_row.addWidget(self.run_btn)
-        btn_row.addWidget(self.stop_btn)
-        btn_row.addWidget(self.import_btn)   # NEW
-        btn_row.addWidget(self.export_btn)   # NEW        
-        btn_row.addStretch()
-        self.run_btn.clicked.connect(self._on_run)
-        self.stop_btn.clicked.connect(self._on_stop)
+        self.form_layout.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
 
-        v = QtWidgets.QVBoxLayout(self)
-        
-        
-        title_row = QtWidgets.QHBoxLayout()
+        # Put the layout on a container widget
+        self._form_container = QtWidgets.QWidget()
+        self._form_container.setLayout(self.form_layout)
+
+        # Wrap it with a scroll area
+        self._form_scroll = QtWidgets.QScrollArea()
+        self._form_scroll.setWidget(self._form_container)
+        self._form_scroll.setWidgetResizable(True)
+        self._form_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self._form_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+
+        # Group box shell and style
+        self._form_box = QtWidgets.QGroupBox("Application Inputs:")
+        base_css = """
+            QGroupBox {
+                border: 2px solid #33BEE8F7;
+                border-radius: 10px;
+                background:#80BEE8F7;
+                margin-top: 24px; padding-top: 12px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                left: 0px; top: -5px;
+                padding: 0 6px;
+                font-size: 20px; font-weight: 1200;
+                background: transparent;
+            }
+
+            /* Checkbox: no stretch background, just the square indicator */
+            QCheckBox { background: transparent; }
+            QCheckBox::indicator {
+                width: 18px; height: 18px;
+                border: 1px solid #94A3B8;
+                border-radius: 3px;
+                background: #ffffff;
+                margin: 0 6px 0 6px;
+            }
+            QCheckBox::indicator:hover   { border-color: #64748B; }
+            QCheckBox::indicator:checked { background: #ADE4F7; border-color: #38B5E0; image: none; }
+            QCheckBox::indicator:disabled{ background: #E5E7EB; border-color: #CBD5E1; }
+        """
+        self._form_box.setStyleSheet(base_css)
+
+        lay = QtWidgets.QVBoxLayout()
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self._form_scroll)
+        self._form_box.setLayout(lay)
+
+        # Size policies: allow width to grow, cap height later via setMaximumHeight
+        self._form_container.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+        self._form_scroll.setSizePolicy(QtWidgets.QSizePolicy.Expanding,   QtWidgets.QSizePolicy.Expanding)
+        self._form_box.setSizePolicy(QtWidgets.QSizePolicy.Expanding,      QtWidgets.QSizePolicy.Maximum)
+
+        # Initial fit to content
+        QtCore.QTimer.singleShot(0, self._fit_inputs_height)
+        return self._form_box
+
+    
+    def _fit_inputs_height(self):
+        """
+        Cap the inputs box so it never grows beyond its content,
+        leaving a small cushion below the last parameter.
+        """
+        if not getattr(self, "_form_box", None) or not getattr(self, "_form_scroll", None):
+            return
+        cont = self._form_scroll.widget()
+        if not cont:
+            return
+
+        # Let Qt recompute size hints first
+        cont.adjustSize()
+
+        # Base content height (use whichever is larger: layout vs container)
+        lay_hint = self.form_layout.sizeHint().height() if getattr(self, "form_layout", None) else 0
+        cont_hint = cont.sizeHint().height()
+        content_h = max(lay_hint, cont_hint)
+
+        # Scroll area extras
+        fw = self._form_scroll.frameWidth()
+        scroll_extra = fw * 2
+
+        # Horizontal scrollbar height (when visible)
+        hbar = self._form_scroll.horizontalScrollBar()
+        hbar_extra = hbar.sizeHint().height() if (hbar and hbar.isVisible()) else 0
+
+        # GroupBox layout margins (top + bottom)
+        gb_layout = self._form_box.layout()
+        m = gb_layout.contentsMargins() if gb_layout else QtCore.QMargins(0, 0, 0, 0)
+        margins_extra = m.top() + m.bottom()
+
+        # Title area allowance
+        title_extra = self._form_box.fontMetrics().height() + 14
+
+        # Add a small cushion so the last row never looks “cut”
+        cushion = max(12, self.form_layout.verticalSpacing() + 8)
+
+        wanted = content_h + scroll_extra + hbar_extra + margins_extra + title_extra + cushion
+
+        # Apply cap (still allows shrinking and scrolling on very long forms)
+        self._form_box.setMaximumHeight(int(wanted))
+        self._form_box.updateGeometry()
+
+
+    # 1.d) Title row (Left: title label, Right: info button)
+    def _create_title_row(self) -> QtWidgets.QHBoxLayout:
+        """Create the header row with current tool title and info button."""
         self.tool_title = QtWidgets.QLabel("<b>No tool selected</b>")
-        self.tool_title.setObjectName("Heading") 
-        font = self.tool_title.font()
-        font.setPointSize(16)        # increase size (try 14–16 for headers)
-        font.setBold(True)           # keep bold
-        self.tool_title.setFont(font)
-        self.tool_title.setAlignment(QtCore.Qt.AlignLeft)  # optional: center it Qt.AlignLeft, Qt.AlignRight, Qt.AlignHCenter, Qt.AlignJustify
+        self.tool_title.setObjectName("Heading")
+        f = self.tool_title.font()
+        f.setPointSize(16); f.setBold(True)
+        self.tool_title.setFont(f)
+        self.tool_title.setAlignment(QtCore.Qt.AlignLeft)
 
-        # --- info button (bigger, circular)
         self.info_btn = QtWidgets.QToolButton()
         self.info_btn.setObjectName("InfoBtn")
         self.info_btn.setToolTip("About this tool")
         self.info_btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
         self.info_btn.clicked.connect(self._show_tool_info)
 
-        # make it ~2× larger
-        ICON_PX = 30          # icon size (try 28–32)
-        PADDING = 2           # inner padding around the icon
-        SIDE    = ICON_PX + PADDING * 2
-
+        ICON_PX, PADDING = 30, 2
+        SIDE = ICON_PX + PADDING * 2
         self.info_btn.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_MessageBoxInformation))
         self.info_btn.setIconSize(QtCore.QSize(ICON_PX, ICON_PX))
         self.info_btn.setFixedSize(SIDE, SIDE)
-
-        self.info_btn.setStyleSheet(f"""
-        QToolButton#InfoBtn {{
-            
-            color: white;
-            border: none;
-            
-        }}
-        QToolButton#InfoBtn:hover   {{ background: #A7D9FC; }}
-        QToolButton#InfoBtn:pressed {{ background: #83C8F7; }}
+        self.info_btn.setStyleSheet("""
+        QToolButton#InfoBtn { color: white; border: none; }
+        QToolButton#InfoBtn:hover   { background: #A7D9FC; }
+        QToolButton#InfoBtn:pressed { background: #83C8F7; }
         """)
 
-        
-        title_row.addWidget(self.tool_title)
-        title_row.addStretch()
-        # title_row.addWidget(info_btn)
-        title_row.addWidget(self.info_btn)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self.tool_title)
+        row.addStretch()
+        row.addWidget(self.info_btn)
+        return row
 
+    # 2) Resizable splitter between Inputs and Logs
+    def _create_io_splitter(self, form_box: QtWidgets.QGroupBox, logs_panel: QtWidgets.QWidget) -> QtWidgets.QSplitter:
+        """Put inputs (top) and logs (bottom) in a vertical splitter."""
+        sp = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        sp.setHandleWidth(6)
+        sp.setOpaqueResize(False)
+        sp.addWidget(form_box)
+        sp.addWidget(logs_panel)
+        sp.setStretchFactor(0, 1)
+        sp.setStretchFactor(1, 1)
+        sp.setSizes([480, 260])  # initial heights
+        return sp
 
+    # 3) Main page layout
+    def _finalize_layout(self, title_row: QtWidgets.QHBoxLayout, splitter: QtWidgets.QSplitter):
+        """Assemble the page: title → splitter → buttons → status."""
+        v = self._root_v
         v.addLayout(title_row)
-        v.addWidget(form_box)
-        v.addWidget(QtWidgets.QLabel("  Application Logs:"))
-        v.addWidget(self.log, 1)
-        # v.addStretch(0) 
-        v.addLayout(btn_row)
+        v.addWidget(splitter, 1)
+        v.addLayout(self._btn_row)
         v.addWidget(self.status)
 
-        # force stretch distribution: only the Logs area gets extra space
-        v.setStretch(v.indexOf(self.tool_title), 0)
-        v.setStretch(v.indexOf(form_box),       0)        
-        v.setStretch(v.indexOf(self.log),       1)   # <-- grows
-        v.setStretch(v.indexOf(btn_row),        0)
-        v.setStretch(v.indexOf(self.status),    0)
+        # keep these (no stretches for child widgets inside splitter)
+        v.setStretch(v.indexOf(self._btn_row), 0)
+        v.setStretch(v.indexOf(self.status),   0)
 
-
-        self.runner: Optional[QProcRunner] = None
-
+    # 4) Button event-trigger
+    def _wire_actions(self):
+        """Connect button actions to handlers and I/O helpers."""
+        self.run_btn.clicked.connect(self._on_run)
+        self.stop_btn.clicked.connect(self._on_stop)
+        self.export_btn.clicked.connect(self._export_params)
+        self.import_btn.clicked.connect(self._import_params)
+        
     def _safe_clear_form_layout(self):
         lay = self.form_layout
         while lay.count():
@@ -874,8 +1006,7 @@ class ToolForm(QtWidgets.QWidget):
         # optional: allow selecting/copying text
         msg.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse | QtCore.Qt.LinksAccessibleByMouse)
         msg.exec()
-        
-
+    
     def set_tool(self, tool: ToolSpec):
         if self._busy:
             return
@@ -916,6 +1047,7 @@ class ToolForm(QtWidgets.QWidget):
                     w = QtWidgets.QCheckBox()
                     d = str(spec.default).strip().lower() if spec.default is not None else ""
                     w.setChecked(d in ("yes", "true", "on", "1"))
+                    
                 elif spec.type == "file":
                     line = QtWidgets.QLineEdit()
                     btn  = QtWidgets.QPushButton("...")
@@ -1010,6 +1142,9 @@ class ToolForm(QtWidgets.QWidget):
             tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
             QtWidgets.QMessageBox.critical(self, "Form Build Error", tb)
         finally:
+            # at the very end of set_tool(...)
+            QtCore.QTimer.singleShot(0, self._fit_inputs_height)
+
             self.setUpdatesEnabled(True)
             self._busy = False
             self.update()
@@ -1231,6 +1366,7 @@ class ToolForm(QtWidgets.QWidget):
             except Exception as e:
                 # Non-fatal: continue applying what we can
                 self.log.appendPlainText(f"[apply] {name}: {e}")
+        QtCore.QTimer.singleShot(0, self._fit_inputs_height)
 
     def _export_params(self):
         """Export current parameters to a JSON file."""
@@ -1859,6 +1995,8 @@ def apply_modern_theme(app: QtWidgets.QApplication, mode: str = "light"):
         pal.setColor(QtGui.QPalette.HighlightedText, QtCore.Qt.black)
         pal.setColor(QtGui.QPalette.PlaceholderText, sub)
         pal.setColor(QtGui.QPalette.WindowText, txt)
+        
+        
 
     app.setPalette(pal)
 
