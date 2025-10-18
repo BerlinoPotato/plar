@@ -18,7 +18,10 @@ def APP_DIR() -> Path:
 
 CONFIG_FILE = str(APP_DIR() / "msrc" / "tools_config.json")
 APP_TITLE   = "PLAR : Python Local App Runner [-_-']"
-
+def APP_ASSET(name: str) -> Path:
+    base = Path(sys.executable).parent if getattr(sys, "frozen", False) else APP_DIR()
+    return base / "data" / "applogo" / name
+APP_ICON_FILE = ("plar.ico")
 
 # ======== class QProcRunner ==============================================================
 # =========================================================================================
@@ -745,15 +748,16 @@ class ToolForm(QtWidgets.QWidget):
         self.log.setTabStopDistance(4 * metrics.horizontalAdvance(" "))
         self.log.setReadOnly(True)
         
-        # Make Application Logs white with dark text
-        pal = self.log.palette()
-        pal.setColor(QtGui.QPalette.Base, QtGui.QColor("#FFFFFF"))   # edit area background
-        pal.setColor(QtGui.QPalette.Text, QtGui.QColor("#010282"))   # text color
-        self.log.setPalette(pal)
+        self.log.setObjectName("LogView")
+        self.log.setStyleSheet("""
+            QPlainTextEdit#LogView {
+                background: #e9f1f6;      /* edit Application Logs background  e9f1f6 FFFFFF */
+                color: #010282;            /* text color */
+                selection-background-color: rgba(255,255,255,255);
+            }
+        """)
 
-        # (optional) ensure it paints its own background
         self.log.setAutoFillBackground(True)
-
 
         # Bundle label + log into a panel
         panel = QtWidgets.QWidget()
@@ -761,6 +765,7 @@ class ToolForm(QtWidgets.QWidget):
         v.setContentsMargins(0, 0, 0, 0)
 
         label = QtWidgets.QLabel("  Application Logs:")
+        
         label.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
 
         v.addWidget(label)
@@ -1524,6 +1529,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, tools: List[ToolSpec]):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
+        self.setWindowIcon(QtGui.QIcon(str(APP_ASSET(APP_ICON_FILE))))
         self.resize(1100, 700)
         self.tools: List[ToolSpec] = tools
         
@@ -2321,6 +2327,7 @@ QtCore.qInstallMessageHandler(_qt_msg_filter)
 def main():
     os.chdir(APP_DIR())
     app = QtWidgets.QApplication(sys.argv)
+    app.setWindowIcon(QtGui.QIcon(str(APP_ASSET(APP_ICON_FILE))))
     # apply_modern_theme(app, mode="auto")  # Light/Dark toggle also available in toolbar
     # settings = QtCore.QSettings("PlarApp", "LocalAppRunner")
     # start_mode = settings.value("theme", "auto")
