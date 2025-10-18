@@ -114,9 +114,6 @@ def load_config(path: str) -> List[ToolSpec]:
 
     tools: List[ToolSpec] = []
     for t in raw:
-        if t.get("runner_mode"): 
-            print('something still call Runner mode 9741')
-            pass
         inputs = []
         for i in t.get("inputs", []):
             i = dict(i)                      # copy
@@ -154,63 +151,6 @@ def save_config(path: str, tools: List[ToolSpec]):
         })
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
-
-# ---------- Runner Thread ----------
-# ======== class ProcRunner ===============================================================
-# =========================================================================================
-class ProcRunner(QtCore.QObject):
-    lineReady   = QtCore.Signal(str)
-    finished    = QtCore.Signal(int)
-    started     = QtCore.Signal()
-    error       = QtCore.Signal(str)
-
-    def __init__(self, cmd: List[str], cwd: Optional[str] = None):
-        super().__init__()
-        self.cmd = cmd
-        self.cwd = cwd
-        self.proc: Optional[subprocess.Popen] = None
-        self._stop = False
-
-    @QtCore.Slot()
-    def run(self):
-        try:
-            self.started.emit()
-            self.proc = subprocess.Popen(
-                self.cmd,
-                cwd=self.cwd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                bufsize=1,
-                universal_newlines=True,
-                text=True,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-            )
-            for line in self.proc.stdout:
-                self.lineReady.emit(line.rstrip("\n"))
-                if self._stop:
-                    break
-            rc = self.proc.wait()
-            self.finished.emit(rc)
-        except Exception as e:
-            self.error.emit(str(e))
-            self.finished.emit(-1)
-
-    def stop(self):
-        self._stop = True
-        try:
-            if self.proc:
-                if os.name == "nt":
-                    # try soft break then kill
-                    self.proc.send_signal(signal.CTRL_BREAK_EVENT)
-                    time.sleep(0.4)
-                    self.proc.kill()
-                else:
-                    self.proc.terminate()
-                    time.sleep(0.5)
-                    if self.proc.poll() is None:
-                        self.proc.kill()
-        except Exception:
-            pass
 
 # ---------- Tool Editor Dialog ----------
 # ======== class ToolEditor ===============================================================
@@ -468,11 +408,10 @@ class ToolEditor(QtWidgets.QDialog):
         lay.addWidget(tabs); lay.addWidget(bb)
         dlg.exec()
 
-
-    def _pick_python(self):
-        fn, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select python.exe", "", "Executables (*.exe);;All files (*.*)")
-        if fn:
-            self.py_edit.setText(fn)
+    # def _pick_python(self):
+    #     fn, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select python.exe", "", "Executables (*.exe);;All files (*.*)")
+    #     if fn:
+    #         self.py_edit.setText(fn)
 
     def _pick_script(self):
         fn, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select script", "", "Python (*.py);;All files (*.*)")
@@ -528,19 +467,6 @@ class ToolEditor(QtWidgets.QDialog):
         for r in rows:
             self.inputs_table.removeRow(r)
 
-    def _get_required_checked(self, row: int) -> bool:
-        cell = self.inputs_table.cellWidget(row, 5)
-        if cell is None:
-            return False
-        layout = cell.layout()
-        if layout is None:
-            return False
-        for i in range(layout.count()):
-            w = layout.itemAt(i).widget()
-            if isinstance(w, QtWidgets.QCheckBox):
-                return w.isChecked()
-        return False
-    
     def _get_checkbox_checked(self, row: int, col: int) -> bool:
         cell = self.inputs_table.cellWidget(row, col)
         if not cell: return False
@@ -582,8 +508,6 @@ class ToolEditor(QtWidgets.QDialog):
             choices_txt = self.inputs_table.cellWidget(r, 4).text().strip()
             choices = [c.strip() for c in choices_txt.split(",")] if (choices_txt and itype in ("enum","multienum")) else None
             
-
-            # required = self._get_required_checked(r)
             required = self._get_checkbox_checked(r, 5)
             readonly = self._get_checkbox_checked(r, 6)
 
@@ -640,7 +564,7 @@ class ToolForm(QtWidgets.QWidget):
         self.fields: Dict[str, QtWidgets.QWidget] = {}
 
         # frequently referenced widgets
-        self.output_dir = QtWidgets.QLineEdit()
+        # self.output_dir = QtWidgets.QLineEdit()
         self.log        = QtWidgets.QPlainTextEdit()
         self.status     = QtWidgets.QLabel("Ready")
         self.cwd        = os.getcwd()
@@ -780,7 +704,7 @@ class ToolForm(QtWidgets.QWidget):
             QGroupBox {
                 border: 2px solid #33BEE8F7;
                 border-radius: 10px;
-                background:#80BEE8F7;
+                background:#80BEE8F7;  /*bright blue ade4f7 light blue 80BEE8F7 */
                 margin-top: 24px; padding-top: 12px;
             }
             QGroupBox::title {
@@ -833,39 +757,27 @@ class ToolForm(QtWidgets.QWidget):
         if not cont:
             return
 
-        # Let Qt recompute size hints first
         cont.adjustSize()
-
-        # Base content height (use whichever is larger: layout vs container)
         lay_hint = self.form_layout.sizeHint().height() if getattr(self, "form_layout", None) else 0
         cont_hint = cont.sizeHint().height()
         content_h = max(lay_hint, cont_hint)
 
-        # Scroll area extras
         fw = self._form_scroll.frameWidth()
         scroll_extra = fw * 2
 
-        # Horizontal scrollbar height (when visible)
         hbar = self._form_scroll.horizontalScrollBar()
         hbar_extra = hbar.sizeHint().height() if (hbar and hbar.isVisible()) else 0
 
-        # GroupBox layout margins (top + bottom)
         gb_layout = self._form_box.layout()
         m = gb_layout.contentsMargins() if gb_layout else QtCore.QMargins(0, 0, 0, 0)
         margins_extra = m.top() + m.bottom()
 
-        # Title area allowance
         title_extra = self._form_box.fontMetrics().height() + 14
-
-        # Add a small cushion so the last row never looks “cut”
         cushion = max(12, self.form_layout.verticalSpacing() + 8)
-
         wanted = content_h + scroll_extra + hbar_extra + margins_extra + title_extra + cushion
 
-        # Apply cap (still allows shrinking and scrolling on very long forms)
         self._form_box.setMaximumHeight(int(wanted))
         self._form_box.updateGeometry()
-
 
     # 1.d) Title row (Left: title label, Right: info button)
     def _create_title_row(self) -> QtWidgets.QHBoxLayout:
@@ -1005,8 +917,7 @@ class ToolForm(QtWidgets.QWidget):
             self._safe_clear_form_layout()
             self.fields.clear()
 
-            # ===== build dynamic fields of selected tool, mini app =====
-            
+            # ===== build dynamic fields of selected tool, mini app =====            
             iCountParam = 0
             for spec in tool.inputs:
                 label = spec.label or spec.name
@@ -1119,7 +1030,7 @@ class ToolForm(QtWidgets.QWidget):
                     elif isinstance(w, QtWidgets.QComboBox):
                         w.setEnabled(False)
 
-            self.output_dir.setText("")
+            # self.output_dir.setText("")
             self.log.clear()
             self.status.setText("Ready")
         except Exception as e:
@@ -1165,7 +1076,7 @@ class ToolForm(QtWidgets.QWidget):
 
             else:
                 vals[spec.name] = str(w.text()).strip()
-        vals["_output_dir"] = self.output_dir.text().strip() or None
+        # vals["_output_dir"] = self.output_dir.text().strip() or None
         return vals
 
     def _on_run(self):
@@ -1180,8 +1091,13 @@ class ToolForm(QtWidgets.QWidget):
                     return
         try:
             cmd = self._build_command(self.tool, vals)
+            if not cmd:
+                raise ValueError("Command could not be built.")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Build Error", str(e))
+            self.status.setText("Ready")
+            self.run_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
             return
 
         self.status.setText("Running...")
@@ -1196,8 +1112,6 @@ class ToolForm(QtWidgets.QWidget):
         if not cmd:
             return
 
-        # Do NOT force cwd changes — inherit current app CWD
-        # If you want to pass env, do env = os.environ.copy()
         self.runner = QProcRunner(self)
         self.runner.lineReady.connect(lambda s: self.log.appendPlainText(s))
         self.runner.finished.connect(self._on_finished)
@@ -1235,7 +1149,8 @@ class ToolForm(QtWidgets.QWidget):
             "python": py, 
             "python_u": f"{py} -u", 
             "script": tool.script or "",
-            "output_dir": (vals.get("_output_dir") or "")}
+            # "output_dir": (vals.get("_output_dir") or "")
+            }
 
         # Extra toggle-friendly placeholders
         for k in toggle_names:
@@ -1245,15 +1160,15 @@ class ToolForm(QtWidgets.QWidget):
             placeholders[f"{k}_01"]   = "1" if on else "0"
         
         # command template, e.g.: "{python} {script} --in {images} --mode {mode} --out {output_dir}"
-            if not tool.runner:
-                raise ValueError("Command template is empty.")
-            # string substitute
-            try:
-                templ = tool.runner.format(**placeholders)
-            except KeyError as e:
-                raise ValueError(f"Missing placeholder in template: {e}")
-            # shlex split to list
-            return shlex.split(templ)
+        if not tool.runner:
+            raise ValueError("Command template is empty.")
+        # string substitute
+        try:
+            templ = tool.runner.format(**placeholders)
+        except KeyError as e:
+            raise ValueError(f"Missing placeholder in template: {e}")
+        # shlex split to list
+        return shlex.split(templ)
 
     def _params_dict(self) -> dict:
         """Build a portable payload of the current tool's parameters."""
@@ -1387,8 +1302,6 @@ class ToolForm(QtWidgets.QWidget):
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Import Failed", str(e))
 
-
-
 #-------------- combo box with icons --------------
 # ======== class CheckableComboBox ========================================================
 # =========================================================================================
@@ -1476,8 +1389,7 @@ class CheckableComboBox(QtWidgets.QComboBox):
     def showPopup(self):
         super().showPopup()
         # Make popup the same width and aligned under the combo (no shift)
-        popup = self.view().window()  # QFrame created by QComboBox
-        # popup.setFixedWidth(self.width())
+        popup = self.view().window()  # QFrame created by QComboBox        
         popup.setFixedWidth(int(self.width() * 1.15))
         popup.move(self.mapToGlobal(QtCore.QPoint(0, self.height())))
 
