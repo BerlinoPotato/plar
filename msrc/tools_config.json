@@ -1,10 +1,8 @@
 [
   {
     "name": "01 : PDF - Combine/Split",
-    "runner_mode": "command",
     "runner": "{python_u} \"{script}\" --pdf1 \"{pdf1}\" --type1 \"{type1}\" --pdf2 \"{pdf2}\" --type2 \"{type2}\" --output \"{output}\"",
     "script": "msrc/runner_combinepdfs.py",
-    "output_dir_optional": false,
     "inputs": [
       {
         "name": "pdf1",
@@ -12,7 +10,6 @@
         "label": "First PDF",
         "default": null,
         "choices": null,
-        "placeholder": null,
         "required": true,
         "readonly": false
       },
@@ -22,7 +19,6 @@
         "label": "Pages of PDF1",
         "default": "all",
         "choices": null,
-        "placeholder": null,
         "required": true,
         "readonly": false
       },
@@ -32,7 +28,6 @@
         "label": "Second PDF (optional)",
         "default": null,
         "choices": null,
-        "placeholder": null,
         "required": false,
         "readonly": false
       },
@@ -42,7 +37,6 @@
         "label": "Pages of PDF1",
         "default": "all",
         "choices": null,
-        "placeholder": null,
         "required": false,
         "readonly": false
       },
@@ -52,7 +46,6 @@
         "label": "Output PDF file",
         "default": "tmp/combined.pdf",
         "choices": null,
-        "placeholder": null,
         "required": false,
         "readonly": false
       },
@@ -61,8 +54,7 @@
         "type": "list",
         "label": "Memo",
         "default": "Page range can be \"all\" or \nRange of page number like 1,2,3 or \nSet of page like 2,3,5-7, 1,9,8",
-        "choices": null,
-        "placeholder": null,
+        "choices": null,        
         "required": false,
         "readonly": true
       }
