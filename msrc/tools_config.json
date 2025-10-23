@@ -1,41 +1,32 @@
 [
   {
-    "name": "01 : PDF - Combine/Split",
-    "runner": "{python_u} \"{script}\" --pdf1 \"{pdf1}\" --type1 \"{type1}\" --pdf2 \"{pdf2}\" --type2 \"{type2}\" --output \"{output}\"",
+    "name": "PDF - Combine/Split",
+    "runner": "{python_u} \"{script}\" --pdfA \"{pdfA}\" --pdfB \"{pdfB}\" --pattern \"{pattern}\" --output \"{output}\"",
     "script": "msrc/runner_combinepdfs.py",
     "inputs": [
       {
-        "name": "pdf1",
+        "name": "pdfA",
         "type": "file",
-        "label": "First PDF",
-        "default": null,
+        "label": "1st PDF [A]",
+        "default": "data/pdf_sample/doc01.pdf",
         "choices": null,
         "required": true,
         "readonly": false
       },
       {
-        "name": "type1",
-        "type": "string",
-        "label": "Pages of PDF1",
-        "default": "all",
-        "choices": null,
-        "required": true,
-        "readonly": false
-      },
-      {
-        "name": "pdf2",
+        "name": "pdfB",
         "type": "file",
-        "label": "Second PDF (optional)",
-        "default": null,
+        "label": "2nd PDF [B]",
+        "default": "data/pdf_sample/doc02.pdf",
         "choices": null,
         "required": false,
         "readonly": false
       },
       {
-        "name": "type2",
+        "name": "pattern",
         "type": "string",
-        "label": "Pages of PDF1",
-        "default": "all",
+        "label": "Mix Pattern",
+        "default": "B,A2-5,B2,B0,B2,A7-4,A12",
         "choices": null,
         "required": false,
         "readonly": false
@@ -44,21 +35,183 @@
         "name": "output",
         "type": "file",
         "label": "Output PDF file",
-        "default": "tmp/combined.pdf",
+        "default": "tmp/combined_<yyyymmddhhmmss>.pdf",
+        "choices": null,
+        "required": false,
+        "readonly": false
+      }
+    ],
+    "notes": "Combine up to two PDFs with page ranges\nUse Mix Patterns to describe how pdfs can will be combined, repeated or cross mixing are allowed!\nExample : B,A2-5,B2,B0,B2,A7-4,A12\nExample : B,A\nExample : A,B2\nExample : A3"
+  },
+  {
+    "name": "Code Helper - Create List",
+    "runner": "{python_u} \"{script}\" --processname \"{processname}\" --input_text \"{input_text}\"",
+    "script": "msrc/runner_small_processing.py",
+    "inputs": [
+      {
+        "name": "processname",
+        "type": "string",
+        "label": "Internal Process Name",
+        "default": "proc_createlist",
+        "choices": null,
+        "required": true,
+        "readonly": true
+      },
+      {
+        "name": "input_text",
+        "type": "list",
+        "label": "Input Text",
+        "default": null,
+        "choices": null,
+        "required": true,
+        "readonly": false
+      }
+    ],
+    "notes": "Create list with bracket, comma separated list"
+  },
+  {
+    "name": "Code Helper - Compile File",
+    "runner": "{python_u} \"{script}\" --processname \"{processname}\" --input_file \"{input_file}\" --output_file \"{output_file}\"",
+    "script": "msrc/runner_small_processing.py",
+    "inputs": [
+      {
+        "name": "processname",
+        "type": "string",
+        "label": "Internal Process Name",
+        "default": "proc_compilefile",
+        "choices": null,
+        "required": true,
+        "readonly": true
+      },
+      {
+        "name": "input_file",
+        "type": "file",
+        "label": "Input Source",
+        "default": "msrc/runner_copmtm_3-3orderstatus_ext_rename.py",
+        "choices": null,
+        "required": true,
+        "readonly": false
+      },
+      {
+        "name": "output_file",
+        "type": "file",
+        "label": "Compile File",
+        "default": "msrc/runner_copmtm_3-3orderstatus_ext.pyc",
+        "choices": null,
+        "required": true,
+        "readonly": false
+      },
+      {
+        "name": "tesf",
+        "type": "multienum",
+        "label": "sfadfaf",
+        "default": "yes",
+        "choices": [
+          "yes",
+          "no",
+          "ok"
+        ],
+        "required": false,
+        "readonly": false
+      }
+    ],
+    "notes": "Compile python code"
+  },
+  {
+    "name": "Code Helper - Grid Layout",
+    "runner": "{python_u} \"{script}\" --processname \"{processname}\" --rows {rows} --cols {cols} --box1 \"{box1}\" --box2 \"{box2}\" --box3 \"{box3}\" --box4 \"{box4}\"",
+    "script": "msrc/runner_small_processing.py",
+    "inputs": [
+      {
+        "name": "processname",
+        "type": "string",
+        "label": "Internal Process Name",
+        "default": "proc_drawgrid",
+        "choices": null,
+        "required": true,
+        "readonly": true
+      },
+      {
+        "name": "rows",
+        "type": "int",
+        "label": "Rows",
+        "default": 20,
+        "choices": null,
+        "required": true,
+        "readonly": false
+      },
+      {
+        "name": "cols",
+        "type": "int",
+        "label": "Columns",
+        "default": 24,
+        "choices": null,
+        "required": true,
+        "readonly": false
+      },
+      {
+        "name": "box1",
+        "type": "string",
+        "label": "Box 1",
+        "default": "0,2,0,15",
         "choices": null,
         "required": false,
         "readonly": false
       },
       {
-        "name": "memo",
-        "type": "list",
-        "label": "Memo",
-        "default": "Page range can be \"all\" or \nRange of page number like 1,2,3 or \nSet of page like 2,3,5-7, 1,9,8",
-        "choices": null,        
+        "name": "box2",
+        "type": "string",
+        "label": "Box 2",
+        "default": "2,8,0,10",
+        "choices": null,
         "required": false,
-        "readonly": true
+        "readonly": false
+      },
+      {
+        "name": "box3",
+        "type": "string",
+        "label": "Box 3",
+        "default": "2,8,10,24",
+        "choices": null,
+        "required": false,
+        "readonly": false
+      },
+      {
+        "name": "box4",
+        "type": "string",
+        "label": "Box 4",
+        "default": "8,20,0,24",
+        "choices": null,
+        "required": false,
+        "readonly": false
       }
     ],
-    "notes": "Combine up to two PDFs with page ranges"
+    "notes": "Compile python code"
+  },
+  {
+    "name": "Code Helper - Complete COP Order",
+    "runner": "{python_u} \"{script}\" --processname \"{processname}\" --cop_order \"{cop_order}\"",
+    "script": "msrc/runner_small_processing.py",
+    "inputs": [
+      {
+        "name": "processname",
+        "type": "string",
+        "label": "Internal Process Name",
+        "default": "proc_completeMUROrder",
+        "choices": null,
+        "required": true,
+        "readonly": true
+      },
+      {
+        "name": "cop_order",
+        "type": "string",
+        "label": "COP Order",
+        "default": null,
+        "choices": null,
+        "required": true,
+        "readonly": false
+      }
+    ],
+    "notes": "Create list with bracket, comma separated list"
   }
 ]

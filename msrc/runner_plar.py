@@ -129,12 +129,46 @@ def load_config(path: str) -> List[ToolSpec]:
         )
     return tools
 
+
 def save_config(path: str, tools: Union["ToolSpec", Sequence["ToolSpec"]]) -> None:
-    
+    """
+    Save tools to disk.
+
+    - If `tools` is a sequence (list), we OVERWRITE the file using exactly that list and order.
+      This preserves positions and correctly handles RENAMES.
+    - If `tools` is a single ToolSpec, we MERGE by name into the existing file (append if new).
+      This is used by 'Save As Default' so it doesn't disturb other tools or their order.
+    """
+    # --- Sequence mode: overwrite in the given order (preserve positions, support renames)
+    if isinstance(tools, Sequence) and not isinstance(tools, (str, bytes)) and not isinstance(tools, ToolSpec):
+        incoming = list(tools)
+
+        data = []
+        for t in incoming:
+            data.append({
+                "name": t.name,
+                "runner": t.runner,
+                "script": t.script,
+                "inputs": [{
+                    "name": i.name,
+                    "type": i.type,
+                    "label": i.label,
+                    "default": i.default,
+                    "choices": i.choices,
+                    "required": i.required,
+                    "readonly": i.readonly,
+                } for i in (t.inputs or [])],
+                "notes": t.notes
+            })
+
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        return
+
+    # --- Single ToolSpec mode: merge-by-name into existing (append if new)
     if isinstance(tools, ToolSpec):
         incoming: List[ToolSpec] = [tools]
-    elif isinstance(tools, Sequence) and not isinstance(tools, (str, bytes)):
-        incoming = list(tools)
     else:
         raise TypeError("tools must be a ToolSpec or a sequence of ToolSpec")
 
@@ -143,7 +177,6 @@ def save_config(path: str, tools: Union["ToolSpec", Sequence["ToolSpec"]]) -> No
         try:
             existing = load_config(path)
         except Exception:
-            # If the file is corrupt, fall back to empty list and proceed
             existing = []
 
     by_name: Dict[str, ToolSpec] = {t.name: t for t in existing}
@@ -151,10 +184,10 @@ def save_config(path: str, tools: Union["ToolSpec", Sequence["ToolSpec"]]) -> No
 
     for t in incoming:
         if t.name in by_name:
-            by_name[t.name] = t  # replace existing with updated
+            by_name[t.name] = t  # replace at same slot
         else:
             by_name[t.name] = t
-            order.append(t.name)  # new tool goes to the end
+            order.append(t.name)  # brand new → goes to end
 
     merged: List[ToolSpec] = [by_name[n] for n in order]
 
@@ -175,6 +208,14 @@ def save_config(path: str, tools: Union["ToolSpec", Sequence["ToolSpec"]]) -> No
             } for i in (t.inputs or [])],
             "notes": t.notes
         })
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+
+
         
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
