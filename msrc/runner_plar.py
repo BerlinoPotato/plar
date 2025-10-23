@@ -1,14 +1,13 @@
 import json, os, sys, threading, subprocess, shlex, time, signal, html
+
 from dataclasses    import dataclass, field
-from typing         import Any, Dict, List, Optional
+from typing         import Any, Dict, Union, List, Sequence, Optional
 from PySide6        import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
 from pathlib        import Path
+
 os.environ["QT_LOGGING_RULES"] = "qt.qpa.window=false"
 from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel, QTextEdit
-
-import warnings
-warnings.simplefilter("ignore", UserWarning)
 
 def APP_DIR() -> Path:
     # If bundled by PyInstaller, use the EXE folder; otherwise use project root (parent of msrc)
@@ -90,8 +89,7 @@ class ToolSpec:
 # =========================================================================================
 # ---------- Utilities ----------
 def load_config(path: str) -> List[ToolSpec]:
-    """Load the tools config file. 
-    If missing, create a simple default config with one fake tool."""
+    
     if not os.path.exists(path):
         # --- create starter config ---
         default_config = [
@@ -131,26 +129,96 @@ def load_config(path: str) -> List[ToolSpec]:
         )
     return tools
 
-def save_config(path: str, tools: List[ToolSpec]):
+def save_config(path: str, tools: Union["ToolSpec", Sequence["ToolSpec"]]) -> None:
+    
+    if isinstance(tools, ToolSpec):
+        incoming: List[ToolSpec] = [tools]
+    elif isinstance(tools, Sequence) and not isinstance(tools, (str, bytes)):
+        incoming = list(tools)
+    else:
+        raise TypeError("tools must be a ToolSpec or a sequence of ToolSpec")
+
+    existing: List[ToolSpec] = []
+    if os.path.exists(path):
+        try:
+            existing = load_config(path)
+        except Exception:
+            # If the file is corrupt, fall back to empty list and proceed
+            existing = []
+
+    by_name: Dict[str, ToolSpec] = {t.name: t for t in existing}
+    order: List[str] = [t.name for t in existing]
+
+    for t in incoming:
+        if t.name in by_name:
+            by_name[t.name] = t  # replace existing with updated
+        else:
+            by_name[t.name] = t
+            order.append(t.name)  # new tool goes to the end
+
+    merged: List[ToolSpec] = [by_name[n] for n in order]
+
     data = []
-    for t in tools:
+    for t in merged:
         data.append({
             "name": t.name,
             "runner": t.runner,
             "script": t.script,
-            "inputs": [{"name": i.name,
-                        "type": i.type,
-                        "label": i.label,
-                        "default": i.default,
-                        "choices": i.choices,
-                        "required": i.required,
-                        "readonly": i.readonly,
-                    } for i in t.inputs],
-
+            "inputs": [{
+                "name": i.name,
+                "type": i.type,
+                "label": i.label,
+                "default": i.default,
+                "choices": i.choices,
+                "required": i.required,
+                "readonly": i.readonly,
+            } for i in (t.inputs or [])],
             "notes": t.notes
         })
+        
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+# ---------- Tool (de)serialization helpers ----------
+def tool_to_dict(t: ToolSpec) -> dict:
+    return {
+        "name": t.name,
+        "runner": t.runner,
+        "script": t.script,
+        "notes": t.notes,
+        "inputs": [{
+            "name": i.name,
+            "type": i.type,
+            "label": i.label,
+            "default": i.default,
+            "choices": i.choices,
+            "required": i.required,
+            "readonly": i.readonly,
+        } for i in (t.inputs or [])],
+    }
+
+def dict_to_tool(d: dict) -> ToolSpec:
+    # tolerate both JSON and loosely-typed values
+    inputs = []
+    for raw in (d.get("inputs") or []):
+        inputs.append(InputSpec(
+            name=str(raw.get("name", "")).strip(),
+            type=str(raw.get("type", "string")).strip() or "string",
+            label=(raw.get("label") or None),
+            default=raw.get("default", None),
+            choices=list(raw.get("choices") or []) or None,
+            required=bool(raw.get("required", False)),
+            readonly=bool(raw.get("readonly", False)),
+        ))
+    return ToolSpec(
+        name=str(d.get("name", "Untitled")).strip() or "Untitled",
+        runner=str(d.get("runner", "")).strip(),
+        script=(d.get("script") or None),
+        inputs=inputs,
+        notes=(d.get("notes") or None),
+    )
+
 
 # ---------- Tool Editor Dialog ----------
 # ======== class ToolEditor ===============================================================
@@ -212,7 +280,7 @@ class ToolEditor(QtWidgets.QDialog):
         btn_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)
         btn_box.accepted.connect(self.accept)
         btn_box.rejected.connect(self.reject)
-
+  
         v = QtWidgets.QVBoxLayout(self)
         v.addLayout(form)
         v.addSpacing(10)
@@ -223,6 +291,59 @@ class ToolEditor(QtWidgets.QDialog):
         # load existing inputs
         for i in self.tool.inputs:
             self._add_input_row(i)
+
+
+    def _on_import_tool(self):
+        dlg = ToolImportDialog(self)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        t = dlg.get_tool()
+        if not t:
+            return
+        # Replace current editor contents with imported tool
+        self.tool = t
+        self.name_edit.setText(t.name or "")
+        self.runner_edit.setText(t.runner or "")
+        self.script_edit.setText(t.script or "")
+        self.notes_edit.setPlainText(t.notes or "")
+
+        # rebuild inputs table
+        self.inputs_table.setRowCount(0)
+        for spec in (t.inputs or []):
+            self._add_input_row(spec)
+
+    def _on_export_tool(self):
+        t = self.result_tool()
+        data = tool_to_dict(t)
+        # dialog: copy or save
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Export Tool")
+        dlg.resize(800, 520)
+        v = QtWidgets.QVBoxLayout(dlg)
+        txt = QtWidgets.QPlainTextEdit()
+        txt.setReadOnly(True)
+        txt.setPlainText(json.dumps(data, indent=2, ensure_ascii=False))
+        v.addWidget(txt, 1)
+        h = QtWidgets.QHBoxLayout()
+        btn_copy = QtWidgets.QPushButton("Copy to Clipboard")
+        btn_save = QtWidgets.QPushButton("Save to File…")
+        btn_close = QtWidgets.QPushButton("Close")
+        def _copy():
+            QtGui.QGuiApplication.clipboard().setText(txt.toPlainText())
+            QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), "Copied!")
+        def _save():
+            safe_tool = "".join(c for c in (t.name or "tool") if c.isalnum() or c in (" ","-","_")).strip()
+            suggested = f"{safe_tool}.tool.json"
+            fn, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Tool JSON", suggested, "JSON (*.json);;All files (*.*)")
+            if not fn: return
+            with open(fn, "w", encoding="utf-8") as f:
+                f.write(txt.toPlainText())
+        btn_copy.clicked.connect(_copy)
+        btn_save.clicked.connect(_save)
+        btn_close.clicked.connect(dlg.accept)
+        h.addStretch(); h.addWidget(btn_copy); h.addWidget(btn_save); h.addWidget(btn_close)
+        v.addLayout(h)
+        dlg.exec()
 
 
     # --- inside ToolEditor class ---
@@ -368,7 +489,6 @@ class ToolEditor(QtWidgets.QDialog):
         }
 
 
-    # --- inside ToolEditor class ---
     def _on_generate_snippets(self):
         specs = self._read_inputs_from_table()
         if not specs:
@@ -407,11 +527,6 @@ class ToolEditor(QtWidgets.QDialog):
         lay = QtWidgets.QVBoxLayout(dlg)
         lay.addWidget(tabs); lay.addWidget(bb)
         dlg.exec()
-
-    # def _pick_python(self):
-    #     fn, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select python.exe", "", "Executables (*.exe);;All files (*.*)")
-    #     if fn:
-    #         self.py_edit.setText(fn)
 
     def _pick_script(self):
         fn, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select script", "", "Python (*.py);;All files (*.*)")
@@ -529,6 +644,22 @@ class ToolEditor(QtWidgets.QDialog):
         )
         return t
 
+
+
+# ---------- _EnterClicksButtonFilter ----------
+# ======== class _EnterClicksButtonFilter ===============================================================
+# =========================================================================================
+class _EnterClicksButtonFilter(QtCore.QObject):
+    def eventFilter(self, obj, ev):
+        if isinstance(obj, QtWidgets.QPushButton) and ev.type() == QtCore.QEvent.KeyPress:
+            if ev.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
+                if obj.isEnabled():
+                    obj.click()
+                    return True  # stop further handling
+        return super().eventFilter(obj, ev)
+
+
+
 # ---------- Dynamic Form ----------
 # ======== class ToolForm =================================================================
 # =========================================================================================
@@ -539,6 +670,8 @@ class ToolForm(QtWidgets.QWidget):
         super().__init__(parent)
         # ---- 0) Core state & essentials -------------------------------------
         self._init_state()
+        
+        self._enter_clicks_filter = _EnterClicksButtonFilter(self)
 
         # ---- 1) Build UI pieces (modular) -----------------------------------
         title_row  = self._create_title_row() # “No tool selected” + info button
@@ -550,11 +683,91 @@ class ToolForm(QtWidgets.QWidget):
         splitter = self._create_io_splitter(form_box, logs_panel)
         self._finalize_layout(title_row, splitter)
         self._wire_actions()
+        
+        self._focus_dump_sc = QtGui.QShortcut(QtGui.QKeySequence("F7"), self)
+        self._focus_dump_sc.activated.connect(self._debug_dump_focus)
+        
+
         self.runner: Optional[QProcRunner] = None
+        
+        self._browse_button_focus_style = """
+            QPushButton:focus {
+                border: 2px solid #ADE4F7;    /* or your preferred focus color */
+                border-radius: 8px;           /* match existing rounded style */
+                outline: none;
+            }
+            """
 
     # ========================================================================
     # =============== Helper builders (private methods) =======================
     # ========================================================================
+
+
+    def _debug_dump_focus(self):
+        w = QtWidgets.QApplication.focusWidget()
+        self.log.appendPlainText("[focus NOW] " + self._describe_widget(w))
+        
+        
+    def _on_focus_changed(self, old, new):
+        # 1) Log a readable description
+        info = self._describe_widget(new)
+        try:
+            self.log.appendPlainText(f"[focus] {info}")
+        except Exception:
+            pass
+
+        # 2) Show in the MainWindow status bar (handy while tabbing)
+        win = self.window()
+        if isinstance(win, QtWidgets.QMainWindow):
+            win.statusBar().showMessage(f"Focus → {info}")
+
+        # 3) Move focus frame only for widgets inside this ToolForm
+        try:
+            if new and self.isAncestorOf(new):
+                self._ff.setWidget(new)
+                self._ff.show()
+            else:
+                self._ff.hide()
+        except Exception:
+            self._ff.hide()
+
+    def _describe_widget(self, w: QtWidgets.QWidget | None) -> str:
+        if not w:
+            return "<None>"
+
+        parts = [w.__class__.__name__]
+        name = w.objectName()
+        if name:
+            parts.append(f"#{name}")
+
+        # short value preview where useful
+        try:
+            if isinstance(w, QtWidgets.QAbstractButton):
+                txt = w.text()
+                if txt: parts.append(f'"{txt}"')
+            elif isinstance(w, QtWidgets.QLineEdit):
+                txt = w.text()
+                if txt: parts.append(f'"{txt[:40]}"')
+            elif isinstance(w, QtWidgets.QPlainTextEdit):
+                t = w.toPlainText()
+                if t: parts.append(f'"{t.splitlines()[0][:40]}"')
+            elif isinstance(w, QtWidgets.QComboBox):
+                parts.append(f'[{w.currentText()}]')
+        except Exception:
+            pass
+
+        # brief ancestry (helps spot it’s in scroll area, splitter, etc.)
+        anc = []
+        p = w.parent()
+        while p and len(anc) < 5:
+            anc.append(p.__class__.__name__)
+            p = p.parent()
+        if anc:
+            parts.append("in " + " ⟵ ".join(anc))
+
+        return " ".join(parts)
+
+
 
     # 0) Core state & essentials
     def _init_state(self):
@@ -593,40 +806,81 @@ class ToolForm(QtWidgets.QWidget):
         self.export_btn = QtWidgets.QPushButton("Export")
         self.import_btn.setMinimumWidth(80)
         self.export_btn.setMinimumWidth(80)
+        self.default_btn = QtWidgets.QPushButton("Save As Default")
+        self.default_btn.setMinimumWidth(100)
+        
+        
+        for b in (self.run_btn, self.stop_btn, self.import_btn, self.export_btn, getattr(self, "default_btn", None)):
+            if b:
+                b.setFocusPolicy(QtCore.Qt.StrongFocus)      # ensure tabbable
+                b.installEventFilter(self._enter_clicks_filter)
+
 
         # Styles exactly as before btn_run btn run 
         self.run_btn.setStyleSheet("""
-        QPushButton#Primary{
-            background:#ADE4F7;
-            color:black;
-            border:1px solid #38B5E0;
-            border-radius:10px;
-            padding:9px 15px;
-            font-weight:600;
-        }               
-        
-        QPushButton#Primary:hover{ background:#38B5E0;}
-        QPushButton#Primary:pressed{ background:#104A91; border:none; border-radius:10px;}
-        QPushButton#Primary:disabled{ background:#D7DEDE; color:rgba(255,255,255,0.85); border:none; border-radius:10px;}
-        """)
+            QPushButton#Primary{
+                background:#C7F1FF;
+                color:black;
+                border:1px solid #C7F1FF;
+                border-radius:10px;
+                padding:9px 15px;
+                font-weight:600;
+            }               
+            
+            QPushButton#Primary:hover{ background:#38B5E0;}
+            QPushButton#Primary:pressed{ background:#104A91; border:none; border-radius:10px;}
+            QPushButton#Primary:disabled{ background:#D7DEDE; color:rgba(255,255,255,0.85); border:none; border-radius:10px;}
+            
+            QPushButton#Primary:focus{
+                border: 2px solid #ADE4F7;     /* blue focus ring */
+                outline: none;
+            }
+            """)
         
         self.stop_btn.setStyleSheet("""
-        QPushButton#Danger{
-            background:#ED7272; color:black;
-            border:none; border-radius:10px;
-            padding:10px 16px; font-weight:600;
-        }
-        QPushButton#Danger:hover{ background:#80ED7272; }
-        QPushButton#Danger:pressed{ background:#b91c1c; }
-        QPushButton#Danger:disabled{ background:#D7DEDE; color:rgba(255,255,255,0.9); }
-        """)
+            QPushButton#Danger{
+                background:#ED7272; color:black;
+                border:none; border-radius:10px;
+                padding:10px 16px; font-weight:600;
+            }
+            QPushButton#Danger:hover{ background:#80ED7272; }
+            QPushButton#Danger:pressed{ background:#b91c1c; }
+            QPushButton#Danger:disabled{ background:#D7DEDE; color:rgba(255,255,255,0.9); }
+            
+            QPushButton#Danger:focus{
+                border: 2px solid #ADE4F7;
+                outline: none;
+            }
+            """)
+        
+        
+        common_btn_focus = """
+            QPushButton:focus {
+                border: 2px solid #ADE4F7;   /* blue border on focus */
+                outline: none;
+            }
+            """
+        self.import_btn.setStyleSheet(self.import_btn.styleSheet() + common_btn_focus)
+        self.export_btn.setStyleSheet(self.export_btn.styleSheet() + common_btn_focus)
+        if hasattr(self, "default_btn"):
+            self.default_btn.setStyleSheet(getattr(self.default_btn, "styleSheet", lambda: "")() + common_btn_focus)
 
+        
+        # Make buttons accept focus via Tab
+        for b in (self.run_btn, self.stop_btn, self.import_btn, self.export_btn, self.default_btn):
+            b.setFocusPolicy(QtCore.Qt.StrongFocus)
+
+        # Optional (mostly effective in dialogs, harmless here)
+        self.run_btn.setAutoDefault(True)
+        self.run_btn.setDefault(True)
+        
         # Build the row layout and keep a handle for later
         self._btn_row = QtWidgets.QHBoxLayout()
         self._btn_row.addWidget(self.run_btn)
         self._btn_row.addWidget(self.stop_btn)
         self._btn_row.addWidget(self.import_btn)
         self._btn_row.addWidget(self.export_btn)
+        self._btn_row.addWidget(self.default_btn) 
         self._btn_row.addStretch()
 
     # 1.b) Logs view (label + QPlainTextEdit)
@@ -662,14 +916,17 @@ class ToolForm(QtWidgets.QWidget):
         """)
 
         self.log.setAutoFillBackground(True)
+        self.log.setFocusPolicy(QtCore.Qt.ClickFocus)  # click to focus; Tab skips
+        self.log.verticalScrollBar().setFocusPolicy(QtCore.Qt.NoFocus)
+        self.log.horizontalScrollBar().setFocusPolicy(QtCore.Qt.NoFocus)
 
         # Bundle label + log into a panel
         panel = QtWidgets.QWidget()
+        panel.setFocusPolicy(QtCore.Qt.NoFocus)
         v = QtWidgets.QVBoxLayout(panel)
         v.setContentsMargins(0, 0, 0, 0)
 
-        label = QtWidgets.QLabel("  Application Logs:")
-        
+        label = QtWidgets.QLabel("  Application Logs:")        
         label.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
 
         v.addWidget(label)
@@ -697,6 +954,10 @@ class ToolForm(QtWidgets.QWidget):
         self._form_scroll.setWidgetResizable(True)
         self._form_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         self._form_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        
+        self._form_scroll.setFocusPolicy(QtCore.Qt.NoFocus)
+        self._form_scroll.verticalScrollBar().setFocusPolicy(QtCore.Qt.NoFocus)
+        self._form_scroll.horizontalScrollBar().setFocusPolicy(QtCore.Qt.NoFocus)
 
         # Group box shell and style
         self._form_box = QtWidgets.QGroupBox("Application Inputs:")
@@ -728,6 +989,10 @@ class ToolForm(QtWidgets.QWidget):
             QCheckBox::indicator:hover   { border-color: #64748B; }
             QCheckBox::indicator:checked { background: #ADE4F7; border-color: #38B5E0; image: none; }
             QCheckBox::indicator:disabled{ background: #E5E7EB; border-color: #CBD5E1; }
+            
+            QCheckBox::indicator:focus {
+                border: 2px solid #ADE4F7;   /* your focus color */
+            }
         """
         self._form_box.setStyleSheet(base_css)
 
@@ -740,7 +1005,8 @@ class ToolForm(QtWidgets.QWidget):
         self._form_container.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
         self._form_scroll.setSizePolicy(QtWidgets.QSizePolicy.Expanding,   QtWidgets.QSizePolicy.Expanding)
         self._form_box.setSizePolicy(QtWidgets.QSizePolicy.Expanding,      QtWidgets.QSizePolicy.Maximum)
-
+        self._form_box.setFocusPolicy(QtCore.Qt.NoFocus)
+        
         # Initial fit to content
         QtCore.QTimer.singleShot(0, self._fit_inputs_height)
         return self._form_box
@@ -779,6 +1045,45 @@ class ToolForm(QtWidgets.QWidget):
         self._form_box.setMaximumHeight(int(wanted))
         self._form_box.updateGeometry()
 
+    
+    def _apply_tab_chain(self):
+        """Make Tab move through fields → buttons → tools list → toolbar."""
+        try:
+            chain = []
+
+            # 1) Parameters in declared order, skip readonly
+            if self.tool:
+                for spec in (self.tool.inputs or []):
+                    if getattr(spec, "readonly", False):
+                        continue
+                    w = self.fields.get(spec.name)
+                    if not w:
+                        continue
+                    target = getattr(w, "_file_line", w)  # focus line-edit for file/folder/password
+                    if isinstance(target, QtWidgets.QWidget) and target.isEnabled() and target.isVisible():
+                        # Ignore things that cannot accept focus
+                        if target.focusPolicy() != QtCore.Qt.NoFocus:
+                            chain.append(target)
+
+            # 2) Buttons row (Run → Stop → Import → Export → Use Default)
+            for b in (getattr(self, "run_btn", None),
+                    getattr(self, "stop_btn", None),
+                    getattr(self, "import_btn", None),
+                    getattr(self, "export_btn", None),
+                    getattr(self, "default_btn", None)):
+                if isinstance(b, QtWidgets.QWidget) and b.isEnabled() and b.isVisible():
+                    if b.focusPolicy() != QtCore.Qt.NoFocus:
+                        chain.append(b)
+
+            # Pairwise setTabOrder
+            for a, b in zip(chain, chain[1:]):
+                QtWidgets.QWidget.setTabOrder(a, b)
+
+        except Exception as e:
+            # Non-fatal: keep running even if tab chaining fails
+            self.log.appendPlainText(f"[taborder] {e}")
+
+    
     # 1.d) Title row (Left: title label, Right: info button)
     def _create_title_row(self) -> QtWidgets.QHBoxLayout:
         """Create the header row with current tool title and info button."""
@@ -800,6 +1105,7 @@ class ToolForm(QtWidgets.QWidget):
         self.info_btn.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_MessageBoxInformation))
         self.info_btn.setIconSize(QtCore.QSize(ICON_PX, ICON_PX))
         self.info_btn.setFixedSize(SIDE, SIDE)
+        self.info_btn.setFocusPolicy(QtCore.Qt.ClickFocus)
         self.info_btn.setStyleSheet("""
         QToolButton#InfoBtn { color: white; border: none; }
         QToolButton#InfoBtn:hover   { background: #A7D9FC; }
@@ -822,6 +1128,7 @@ class ToolForm(QtWidgets.QWidget):
         sp.addWidget(logs_panel)
         sp.setStretchFactor(0, 1)
         sp.setStretchFactor(1, 1)
+        sp.setFocusPolicy(QtCore.Qt.NoFocus)
         sp.setSizes([480, 260])  # initial heights
         return sp
 
@@ -845,7 +1152,56 @@ class ToolForm(QtWidgets.QWidget):
         self.stop_btn.clicked.connect(self._on_stop)
         self.export_btn.clicked.connect(self._export_params)
         self.import_btn.clicked.connect(self._import_params)
+        self.default_btn.clicked.connect(self._on_set_default)
         
+    
+    def _on_set_default(self):
+        if not self.tool:
+            QtWidgets.QMessageBox.information(self, "Default", "No tool selected.")
+            return
+
+        values = self.collect_values()
+        tool = self.tool
+        changes = []
+
+        for spec in tool.inputs:
+            if spec.readonly:
+                continue
+            current_val = values.get(spec.name)
+            old_default = spec.default
+            if str(current_val) != str(old_default):
+                changes.append((spec.name, old_default, current_val))
+
+        if not changes:
+            QtWidgets.QMessageBox.information(self, "No Changes", "Current values already match defaults.")
+            return
+
+        # Build warning message
+        msg = "The following defaults will be updated:\n\n"
+        for name, old, new in changes:
+            msg += f"{name}:\n   Old: {old}\n   New: {new}\n\n"
+
+        reply = QtWidgets.QMessageBox.question(
+            self, "Confirm Default Update", msg,
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
+        )
+
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+
+        # Apply new defaults to tool spec
+        for spec in tool.inputs:
+            if spec.readonly:
+                continue
+            if spec.name in values:
+                spec.default = values[spec.name]
+
+        # Save to config file
+        save_config(CONFIG_FILE, self.tool)
+        
+        QtWidgets.QMessageBox.information(self, "Defaults Saved", "Default values updated successfully.")
+
+    
     def _safe_clear_form_layout(self):
         lay = self.form_layout
         while lay.count():
@@ -863,8 +1219,9 @@ class ToolForm(QtWidgets.QWidget):
         t    = self.tool
         title = esc(t.name or "Untitled tool")
         notes = esc((t.notes or "—").strip())
+        lv_script = esc(t.script or "Unknown Script")
 
-        # Build parameters list as HTML
+        # Build parameters list as HTML i information button info info-button
         items = []
         iCountParameter = 0
         for spec in t.inputs:
@@ -889,8 +1246,10 @@ class ToolForm(QtWidgets.QWidget):
 
         html_body = f"""
         <div style="font-size: 12pt; font-weight:700; margin-bottom:6px;">{title}</div>
+        <div style="margin:10px 0 4px 0;"><b>Script</b></div>
+        <div>{lv_script}</div>
         <div style="margin:10px 0 4px 0;"><b>Tool information</b></div>
-        <div>{notes}</div>        
+        <div>{notes}</div>
         <div style="margin:8px 0;"><b>Parameters</b></div>
         {params_html}
         """
@@ -933,7 +1292,36 @@ class ToolForm(QtWidgets.QWidget):
                     w = QtWidgets.QDoubleSpinBox(); w.setRange(-1e12, 1e12); w.setDecimals(6)
                     if isinstance(spec.default, (int,float)): w.setValue(float(spec.default))
                 elif spec.type == "date":
-                    w = QtWidgets.QDateEdit(); w.setCalendarPopup(True); w.setDisplayFormat("yyyy-MM-dd")
+                    w = QtWidgets.QDateEdit(); w.setCalendarPopup(True); w.setDisplayFormat("yyyy-MM-dd")       #beeeeee focus
+                    
+                    w.setFocusPolicy(QtCore.Qt.StrongFocus)
+
+                    # Make focus look like a single box (blue border) and hide the inner “section” highlight
+                    w.setStyleSheet("""
+                    QDateEdit {
+                        border: 1px solid #BFD9E7;
+                        border-radius: 8px;
+                        padding: 6px 10px;
+                    }
+                    QDateEdit:focus {
+                        border: 2px solid #ADE4F7;   /* outer blue ring */
+                        outline: none;
+                    }
+                    /* Remove any inner line-edit borders and kill the section selection fill */
+                    QDateEdit QLineEdit {
+                        border: none;
+                        padding: 0;
+                        margin: 0;
+                        selection-background-color: transparent;
+                        selection-color: inherit;
+                    }
+                    /* Keep the dropdown button clean */
+                    QDateEdit::drop-down {
+                        width: 22px;
+                        border: none;
+                        margin-right: 4px;
+                    }
+                    """)
                     if spec.default:
                         qd = QtCore.QDate.fromString(str(spec.default), "yyyy-MM-dd")
                         w.setDate(qd if qd.isValid() else QtCore.QDate.currentDate())
@@ -941,8 +1329,28 @@ class ToolForm(QtWidgets.QWidget):
                         w.setDate(QtCore.QDate.currentDate())
                 elif spec.type == "toggle":
                     w = QtWidgets.QCheckBox()
+                    w.setFocusPolicy(QtCore.Qt.StrongFocus)                      # allow Tab focus
+                    # w.setStyleSheet(w.styleSheet() + self._checkbox_focus_qss)   # apply focus style
                     d = str(spec.default).strip().lower() if spec.default is not None else ""
                     w.setChecked(d in ("yes", "true", "on", "1"))
+                    
+                    w.setStyleSheet("""
+                        QCheckBox::indicator {
+                            width: 18px;
+                            height: 18px;
+                            border: 1px solid #BFD9E7;
+                            border-radius: 4px;
+                            background: white;
+                        }
+                        QCheckBox::indicator:checked {
+                            background: #38B5E0;
+                            border: 1px solid #38B5E0;
+                        }
+                        QCheckBox::indicator:focus {
+                            border: 2px solid #ADE4F7;
+                        }
+                        """)
+
                     
                 elif spec.type == "file":
                     line = QtWidgets.QLineEdit()
@@ -950,6 +1358,12 @@ class ToolForm(QtWidgets.QWidget):
                     cnt  = QtWidgets.QWidget()
                     h = QtWidgets.QHBoxLayout(cnt); h.setContentsMargins(0,0,0,0)
                     h.addWidget(line, 1); h.addWidget(btn)
+                    
+                    btn.setFocusPolicy(QtCore.Qt.StrongFocus)  # allow tab focus
+                    btn.installEventFilter(self._enter_clicks_filter)
+                    btn.setStyleSheet(btn.styleSheet() + self._browse_button_focus_style)
+
+                    
                     def pick_file(checked=False, le=line):
                         fn, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select File", le.text() or self.cwd, "All files (*.*)")
                         if fn: le.setText(fn)
@@ -961,6 +1375,11 @@ class ToolForm(QtWidgets.QWidget):
                     cnt  = QtWidgets.QWidget()
                     h = QtWidgets.QHBoxLayout(cnt); h.setContentsMargins(0,0,0,0)
                     h.addWidget(line, 1); h.addWidget(btn)
+                    
+                    btn.setFocusPolicy(QtCore.Qt.StrongFocus)
+                    btn.installEventFilter(self._enter_clicks_filter)
+                    btn.setStyleSheet(btn.styleSheet() + self._browse_button_focus_style)
+                    
                     def pick_folder(checked=False, le=line):
                         fn = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Folder", le.text() or self.cwd)
                         if fn: le.setText(fn)
@@ -1040,12 +1459,47 @@ class ToolForm(QtWidgets.QWidget):
         finally:
             # at the very end of set_tool(...)
             QtCore.QTimer.singleShot(0, self._fit_inputs_height)
+            # at the very end of set_tool(.)
+            QtCore.QTimer.singleShot(0, self._fit_inputs_height)
+            QtCore.QTimer.singleShot(0, self._focus_first_editable)   # <— add this
+
 
             self.setUpdatesEnabled(True)
             self._busy = False
             self.update()
 
 
+    def _focus_first_editable(self):
+        """Focus the first non-readonly input widget for the current tool."""
+        if not self.tool:
+            return
+
+        # Walk specs in declared order; pick the first that's not readonly
+        for spec in self.tool.inputs:
+            if getattr(spec, "readonly", False):
+                continue
+
+            w = self.fields.get(spec.name)
+            if not w:
+                continue
+
+            # If it's a composite (file/folder/password with browse), the line edit is _file_line
+            target = getattr(w, "_file_line", w)
+
+            # Skip disabled widgets (e.g., readonly combos)
+            if hasattr(target, "isEnabled") and not target.isEnabled():
+                continue
+
+            # Give focus; select text in line edits for quick typing
+            target.setFocus(QtCore.Qt.OtherFocusReason)
+            try:
+                if isinstance(target, QtWidgets.QLineEdit):
+                    target.selectAll()
+            except Exception:
+                pass
+            return
+
+    
     def collect_values(self) -> Dict[str, Any]:
         vals = {}
         if not self.tool:
@@ -1076,12 +1530,13 @@ class ToolForm(QtWidgets.QWidget):
 
             else:
                 vals[spec.name] = str(w.text()).strip()
-        # vals["_output_dir"] = self.output_dir.text().strip() or None
+        
         return vals
 
     def _on_run(self):
         if not self.tool:
             return
+
         vals = self.collect_values()
         for spec in self.tool.inputs:
             if spec.required:
@@ -1120,7 +1575,6 @@ class ToolForm(QtWidgets.QWidget):
         env["PYTHONUNBUFFERED"] = "1"     # unbuffer stdout/stderr
         env["PYTHONIOENCODING"] = "utf-8" # good for non-ASCII output
         
-        # self.runner.start(cmd, cwd=None)   # keep current working directory
         self.runner.start(cmd, cwd=None, env=env) 
 
     def _on_stop(self):
@@ -1172,7 +1626,7 @@ class ToolForm(QtWidgets.QWidget):
 
     def _params_dict(self) -> dict:
         """Build a portable payload of the current tool's parameters."""
-        vals = self.collect_values()                 # you already have this
+        self.collect_values()                 # you already have this
         # strip special/internal keys
         vals = {k: v for k, v in vals.items() if not k.startswith("_")}
         meta = {
@@ -1392,6 +1846,164 @@ class CheckableComboBox(QtWidgets.QComboBox):
         popup = self.view().window()  # QFrame created by QComboBox        
         popup.setFixedWidth(int(self.width() * 1.15))
         popup.move(self.mapToGlobal(QtCore.QPoint(0, self.height())))
+        
+        
+# ======== class ToolImportDialog ========================================================
+# =========================================================================================   
+class ToolImportDialog(QtWidgets.QDialog):
+    """Import a ToolSpec from a file or pasted JSON/plain text."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Import Tool")
+        self.resize(820, 520)
+
+        tabs = QtWidgets.QTabWidget(self)
+
+        # Tab 1: From file
+        w_file = QtWidgets.QWidget()
+        v1 = QtWidgets.QVBoxLayout(w_file)
+        self.file_line = QtWidgets.QLineEdit()
+        btn_browse = QtWidgets.QPushButton("Browse…")
+        def _browse():
+            fn, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open Tool JSON", "", "JSON (*.json);;All files (*.*)")
+            if fn: self.file_line.setText(fn)
+        btn_browse.clicked.connect(_browse)
+        h1 = QtWidgets.QHBoxLayout()
+        h1.addWidget(self.file_line, 1); h1.addWidget(btn_browse)
+        self.file_preview = QtWidgets.QPlainTextEdit(); self.file_preview.setReadOnly(True)
+        v1.addLayout(h1); v1.addWidget(self.file_preview, 1)
+
+        def _load_preview():
+            fn = self.file_line.text().strip()
+            if not fn: return
+            try:
+                with open(fn, "r", encoding="utf-8") as f:
+                    self.file_preview.setPlainText(f.read())
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Read error", str(e))
+        self.file_line.editingFinished.connect(_load_preview)
+
+        # Tab 2: Paste JSON / Text
+        w_text = QtWidgets.QWidget()
+        v2 = QtWidgets.QVBoxLayout(w_text)
+        hint = QtWidgets.QLabel(
+            "Paste JSON (preferred), or use simple text:\n"
+            "name: My Tool\nrunner: {python_u} \"{script}\" --in {in}\nscript: C:/path/tool.py\n"
+            "notes: any notes here\n"
+            "inputs:\n"
+            "  name,type,label,default,choices,required,readonly\n"
+            "  in,file,Input file,,,*false*,*false*\n"
+            "  mode,enum,Mode,fast,fast|slow,*false*,*false*"
+        )
+        hint.setStyleSheet("color:#444;")
+        self.text_edit = QtWidgets.QPlainTextEdit()
+        self.text_edit.setPlaceholderText("{ ... JSON ... }  OR  key: value lines + an 'inputs:' CSV block")
+        v2.addWidget(hint); v2.addWidget(self.text_edit, 1)
+
+        tabs.addTab(w_file, "From file")
+        tabs.addTab(w_text, "Paste JSON / Text")
+
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept); bb.rejected.connect(self.reject)
+
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.addWidget(tabs, 1)
+        lay.addWidget(bb)
+
+    def _parse_loose_text(self, s: str) -> dict:
+        """
+        Very small parser for 'key: value' lines + an 'inputs:' CSV section.
+        """
+        lines = [ln.strip() for ln in s.splitlines()]
+        head: dict[str, str] = {}
+        inputs_csv: list[list[str]] = []
+        in_inputs = False
+        for ln in lines:
+            if not ln: continue
+            if in_inputs:
+                # accept header or data rows, split by comma
+                row = [c.strip() for c in ln.split(",")]
+                if row and any(row):
+                    inputs_csv.append(row)
+                continue
+            if ln.lower().startswith("inputs:"):
+                in_inputs = True
+                continue
+            if ":" in ln:
+                k, v = ln.split(":", 1)
+                head[k.strip().lower()] = v.strip()
+        # build dict
+        d = {
+            "name": head.get("name", "Untitled"),
+            "runner": head.get("runner", ""),
+            "script": head.get("script") or None,
+            "notes": head.get("notes") or None,
+            "inputs": []
+        }
+        # try mapping CSV rows → InputSpec
+        # allow header row; find columns by name if present, else by position
+        def norm_bool(s):
+            return str(s).strip().lower() in ("1","true","yes","y","on","*true*")
+        # consume rows, skip header if it contains 'name' and 'type'
+        if inputs_csv:
+            header = [c.lower() for c in inputs_csv[0]]
+            has_header = ("name" in header and "type" in header)
+            rows = inputs_csv[1:] if has_header else inputs_csv
+            # column indices
+            def idx(col, default=None):
+                return header.index(col) if has_header and col in header else default
+            for r in rows:
+                get = lambda i: (r[i].strip() if (i is not None and i < len(r)) else "")
+                name = get(idx("name", 0))
+                if not name: continue
+                typ  = get(idx("type", 1)) or "string"
+                label= get(idx("label", 2)) or None
+                default = get(idx("default", 3)) or None
+                choices_raw = get(idx("choices", 4)) or ""
+                choices = None
+                if choices_raw:
+                    # pipe or comma separated
+                    choices = [x.strip() for x in choices_raw.replace("|", ",").split(",") if x.strip()] or None
+                required = norm_bool(get(idx("required", 5)))
+                readonly = norm_bool(get(idx("readonly", 6)))
+                d["inputs"].append({
+                    "name": name, "type": typ, "label": label,
+                    "default": default, "choices": choices,
+                    "required": required, "readonly": readonly
+                })
+        return d
+
+    def get_tool(self) -> ToolSpec | None:
+        # File tab takes precedence if a path provided
+        src = self.file_line.text().strip()
+        try_text = None
+        if src:
+            try:
+                with open(src, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return dict_to_tool(data)
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Import failed", f"Could not parse file:\n{e}")
+                return None
+
+        # Otherwise parse pasted text
+        try_text = self.text_edit.toPlainText().strip()
+        if not try_text:
+            QtWidgets.QMessageBox.information(self, "Nothing to import", "Provide a file or paste JSON/text.")
+            return None
+        # JSON first
+        try:
+            data = json.loads(try_text)
+            return dict_to_tool(data)
+        except Exception:
+            pass
+        # Loose text parser
+        try:
+            data = self._parse_loose_text(try_text)
+            return dict_to_tool(data)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Import failed", f"Could not parse pasted text:\n{e}")
+            return None
 
 
 # ---------- Main Window ----------
@@ -1425,13 +2037,12 @@ class MainWindow(QtWidgets.QMainWindow):
         
         self.list.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._show_list_menu)
+        self.list.setFocusPolicy(QtCore.Qt.ClickFocus)  # mouse only; Tab skips
+
 
         font = self.list.font()
-        font.setPointSize(11)          # try 13–15
-        # font.setBold(True)             # optional
-        self.list.setFont(font)
-        
-        
+        font.setPointSize(11)
+        self.list.setFont(font)                
         self._reload_list()
 
         # Right: form
@@ -1439,7 +2050,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ===== Menu Bar =====
         mb = self.menuBar()
-        
         
         # bump menu fonts
         f = mb.font()
@@ -1471,8 +2081,13 @@ class MainWindow(QtWidgets.QMainWindow):
         dup_act   = QtGui.QAction("Duplicate", self);   dup_act.triggered.connect(self._dup_tool)
         del_act   = QtGui.QAction("Delete", self);      del_act.triggered.connect(self._del_tool)
         save_act  = QtGui.QAction("Save Config", self); save_act.triggered.connect(self._save)
-        load_cfg_act = QtGui.QAction("Load Config File…", self)
-        
+        load_cfg_act = QtGui.QAction("Load Config File…", self)  #load config file
+                # NEW: tool-level import/export
+        import_tool_act = QtGui.QAction("Import Tool…", self)
+        export_tool_act = QtGui.QAction("Export Tool…", self)
+        import_tool_act.triggered.connect(self._import_tool)
+        export_tool_act.triggered.connect(self._export_tool)
+
         
         # optional shortcuts
         add_act.setShortcut("Ctrl+N")
@@ -1480,6 +2095,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dup_act.setShortcut("Ctrl+D")
         del_act.setShortcut("Del")
         load_cfg_act.setShortcut("Ctrl+L") 
+        
 
         # # --- Theme menu (stable switching) ---
         # theme_menu = mb.addMenu("Theme")
@@ -1503,13 +2119,13 @@ class MainWindow(QtWidgets.QMainWindow):
         
         load_cfg_act.triggered.connect(self._load_config_file)
         
-
-        # ---- Menus (add actions AFTER they exist)
         m_tools = mb.addMenu("Tools")
         m_tools.addAction(add_act)
         m_tools.addAction(edit_act)
-        m_tools.addAction(dup_act)
+        m_tools.addAction(import_tool_act)
+        m_tools.addAction(export_tool_act)
         m_tools.addSeparator()
+        m_tools.addAction(dup_act)        
         m_tools.addAction(del_act)
         m_tools.addSeparator()
         m_tools.addAction(load_cfg_act)
@@ -1521,11 +2137,12 @@ class MainWindow(QtWidgets.QMainWindow):
         splitter = QtWidgets.QSplitter()
         splitter.addWidget(self.list)
         splitter.addWidget(self.form)
-        splitter.setSizes([320, 900])     # initial widths for [left, right]
-        splitter.setStretchFactor(0, 0)   # left pane doesn’t auto-grow
-        splitter.setStretchFactor(1, 1)   # right pane takes extra space
+        splitter.setSizes([320, 900])
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
         
         # In MainWindow.__init__ after creating splitter
+        splitter.setFocusPolicy(QtCore.Qt.NoFocus)
         splitter.setHandleWidth(6)
         margins = 12
         central = QtWidgets.QWidget()
@@ -1572,6 +2189,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._resizing = False
         # one clean repaint
         self.form.update()
+        
     def eventFilter(self, obj, ev):
         if obj is self.list and ev.type() == QtCore.QEvent.MouseButtonDblClick:
             return True  # swallow double-clicks; we only want single selection changes
@@ -1617,6 +2235,12 @@ class MainWindow(QtWidgets.QMainWindow):
         act_edit = menu.addAction(s.standardIcon(QtWidgets.QStyle.SP_FileDialogDetailedView), "Edit Tool", self._edit_tool)
         act_dup  = menu.addAction(s.standardIcon(QtWidgets.QStyle.SP_DialogOkButton), "Duplicate", self._dup_tool)
         act_del  = menu.addAction(s.standardIcon(QtWidgets.QStyle.SP_TrashIcon), "Delete", self._del_tool)
+        
+        menu.addSeparator()
+        menu.addAction("Import Tool…", self._import_tool)
+        act_export_ctx = menu.addAction("Export Tool…", self._export_tool)
+        act_export_ctx.setEnabled(self._current_tool_index() >= 0)
+        
         menu.addSeparator()
 
         act_up   = menu.addAction("Move Up",   lambda: self._move_tool(-1))
@@ -1765,6 +2389,41 @@ class MainWindow(QtWidgets.QMainWindow):
         save_config(CONFIG_FILE, self.tools)
         if not silent:
             QtWidgets.QMessageBox.information(self, "Saved", f"Saved to {CONFIG_FILE}")
+            
+    def _import_tool(self):
+        dlg = ToolImportDialog(self)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        t = dlg.get_tool()
+        if not t:
+            return
+        # Append and persist
+        self.tools.append(t)
+        self._reload_list()
+        self.list.setCurrentRow(self.list.count() - 1)
+        self._save(silent=True)
+        QtWidgets.QMessageBox.information(self, "Imported", f"Added tool: {t.name}")
+
+    def _export_tool(self):
+        idx = self._current_tool_index()
+        if idx < 0:
+            QtWidgets.QMessageBox.information(self, "Export Tool", "Select a tool first.")
+            return
+        t = self.tools[idx]
+        data = tool_to_dict(t)
+        # Save to file
+        safe_tool = "".join(c for c in (t.name or "tool") if c.isalnum() or c in (" ","-","_")).strip()
+        suggested = f"{safe_tool}.tool.json"
+        fn, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export Tool", suggested, "JSON (*.json);;All files (*.*)")
+        if not fn:
+            return
+        try:
+            with open(fn, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            QtWidgets.QMessageBox.information(self, "Exported", f"Saved: {Path(fn).name}")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Export failed", str(e))
+
     
     def _load_config_file(self):
         """Pick a JSON file and overwrite CONFIG_FILE, then reload list/UI."""
@@ -1891,8 +2550,6 @@ def apply_modern_theme(app: QtWidgets.QApplication, mode: str = "light"):
         pal.setColor(QtGui.QPalette.HighlightedText, QtCore.Qt.black)
         pal.setColor(QtGui.QPalette.PlaceholderText, sub)
         pal.setColor(QtGui.QPalette.WindowText, txt)
-        
-        
 
     app.setPalette(pal)
 
@@ -2011,16 +2668,6 @@ def apply_modern_theme(app: QtWidgets.QApplication, mode: str = "light"):
             font-size: 13px;
             color: #555;
             padding-bottom: 2px;
-        }
-        QLineEdit, QComboBox, QTextEdit {
-            border: none;
-            border-bottom: 2px solid rgba(0,0,0,0.15);
-            border-radius: 0;
-            padding: 4px;
-            background: transparent;
-        }
-        QLineEdit:focus, QComboBox:focus {
-            border-bottom: 2px solid #1c2121; 
         }
         
         QGroupBox QLineEdit,
@@ -2219,5 +2866,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# 
