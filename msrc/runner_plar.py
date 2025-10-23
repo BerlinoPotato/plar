@@ -213,14 +213,6 @@ def save_config(path: str, tools: Union["ToolSpec", Sequence["ToolSpec"]]) -> No
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-
-
-
-        
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-
 # ---------- Tool (de)serialization helpers ----------
 def tool_to_dict(t: ToolSpec) -> dict:
     return {
